@@ -145,19 +145,19 @@ const SECTIONS: SectionConfig[] = [
     emptyKey: 'tunnels_empty_gre',
     emptyDescKey: 'tunnels_empty_gre_desc',
     subtabKey: 'tunnels_subtab_gre',
-    protocol: (i) => 'GRE',
+    protocol: () => 'GRE',
   },
   {
     type: 'sutaw',
     icon: <Waypoints className="w-[18px] h-[18px]" />,
-    tone: 'brand',
+    tone: 'primary',
     titleKey: 'tunnels_sutaw_title',
     descKey: 'tunnels_sutaw_desc',
     newKey: 'tunnels_btn_new_sutaw',
     emptyKey: 'tunnels_empty_sutaw',
     emptyDescKey: 'tunnels_empty_sutaw_desc',
     subtabKey: 'tunnels_subtab_sutaw',
-    protocol: (i) => 'GRE (NAT)',
+    protocol: () => 'GRE (NAT)',
   },
 ];
 
@@ -238,7 +238,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
       const list = (tunnels[s.type] || []) as AnyTunnel[];
       out[s.type] = q
         ? list.filter((i) =>
-            [i.TUNNEL_NAME || (i as any).NAME, i.TARGET_IP || (i as any).REMOTE_IP, (i as any).PORT_SPEC, i._node_name, i._node_ip]
+            [(i as any).TUNNEL_NAME || (i as any).NAME, (i as any).TARGET_IP || (i as any).REMOTE_IP, (i as any).PORT_SPEC, i._node_name, i._node_ip]
               .filter(Boolean)
               .some((v) => String(v).toLowerCase().includes(q))
           )
@@ -459,7 +459,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                     const readOnly = !item._is_local && isFailed(node);
                     return (
                       <li
-                        key={`${item._node_ip || 'local'}:${item.TUNNEL_NAME || (item as any).NAME}`}
+                        key={`${item._node_ip || 'local'}:${(item as any).TUNNEL_NAME || (item as any).NAME}`}
                         className={`group flex flex-col gap-3 p-3.5 rounded-xl border border-card-border bg-surface transition-colors hover:border-border-strong ${
                           readOnly ? 'opacity-75' : ''
                         }`}
@@ -467,7 +467,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
                             <p className="font-mono text-sm font-semibold text-text-primary truncate" dir="ltr">
-                              {item.TUNNEL_NAME || (item as any).NAME}
+                              {(item as any).TUNNEL_NAME || (item as any).NAME}
                             </p>
                             {showOrigin && item._node_name && (
                               <p className="flex items-center gap-1 mt-0.5 text-xs text-text-muted min-w-0">
@@ -487,7 +487,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handlers[s.type].edit(item)}
-                                aria-label={formatText(t('tunnels_edit_label'), { name: item.TUNNEL_NAME || (item as any).NAME })}
+                                aria-label={formatText(t('tunnels_edit_label'), { name: (item as any).TUNNEL_NAME || (item as any).NAME })}
                                 title={t('btn_edit')}
                                 className={iconBtnSm}
                               >
@@ -495,8 +495,8 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => onDeleteTunnel(s.type, item.TUNNEL_NAME || (item as any).NAME, item._node_ip)}
-                                aria-label={formatText(t('tunnels_delete_label'), { name: item.TUNNEL_NAME || (item as any).NAME })}
+                                onClick={() => onDeleteTunnel(s.type, (item as any).TUNNEL_NAME || (item as any).NAME, item._node_ip)}
+                                aria-label={formatText(t('tunnels_delete_label'), { name: (item as any).TUNNEL_NAME || (item as any).NAME })}
                                 title={t('btn_delete')}
                                 className={`${iconBtnSm} hover:text-danger hover:bg-danger-subtle`}
                               >
@@ -515,7 +515,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                           )}
                           <ArrowRight className="w-3.5 h-3.5 shrink-0 text-text-subtle" aria-hidden="true" />
                           <span className="text-text-secondary truncate" title={t('tunnels_col_destination')}>
-                            {item.TARGET_IP || (item as any).REMOTE_IP || '—'}
+                            {(item as any).TARGET_IP || (item as any).REMOTE_IP || '—'}
                           </span>
                         </div>
 

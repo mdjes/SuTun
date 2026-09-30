@@ -9,7 +9,7 @@ import { FieldError } from '../NodeConfig/FormControls';
 import { btnPrimary, btnSecondary, Callout, hintClass, inputClass, labelClass, Pill, Segmented, selectClass, toneSoft, Tone } from '../ui';
 import { ModalClose, ModalShell } from './ModalShell';
 
-export type TunnelModalType = 'haproxy' | 'iptables' | 'gost' | 'realm' | 'sutaw';
+export type TunnelModalType = 'haproxy' | 'iptables' | 'gost' | 'realm' | 'sutaw' | 'gre';
 
 interface TunnelModalProps {
   isOpen: boolean;
@@ -32,7 +32,8 @@ const ENGINES: Record<TunnelModalType, { name: string; icon: React.ReactNode; to
   haproxy: { name: 'HAProxy', icon: <Network className="w-5 h-5" />, tone: 'primary', desc: 'tunnels_haproxy_desc' },
   iptables: { name: 'iptables', icon: <Boxes className="w-5 h-5" />, tone: 'info', desc: 'tunnels_iptables_desc' },
   gost: { name: 'GOST', icon: <Zap className="w-5 h-5" />, tone: 'warning', desc: 'tunnels_gost_desc' },
-  sutaw: { name: 'SUTAW-Gre', icon: <Network className="w-5 h-5" />, tone: 'brand', desc: 'tunnels_sutaw_desc' },
+  sutaw: { name: 'SUTAW-Gre', icon: <Network className="w-5 h-5" />, tone: 'primary', desc: 'tunnels_sutaw_desc' },
+  gre: { name: 'GRE', icon: <Network className="w-5 h-5" />, tone: 'info', desc: 'tunnels_gre_desc' },
 };
 
 const PRESETS: Record<TunnelModalType, { val: string; key: TranslationKey }[]> = {
@@ -65,6 +66,7 @@ const PRESETS: Record<TunnelModalType, { val: string; key: TranslationKey }[]> =
     { val: '1080', key: 'preset_socks' },
   ],
   sutaw: [],
+  gre: [],
 };
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
@@ -254,17 +256,16 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
           { value: 'tcp', label: 'TCP' },
           { value: 'both', label: 'TCP + UDP' },
         ]
-      : [
-          { value: 'both', label: 'TCP + UDP' },
-          { value: 'tcp', label: 'TCP' },
-          { value: 'udp', label: 'UDP' },
-        ]
       : type === 'sutaw'
       ? [
           { value: 'iran', label: 'Iran (Local)' },
           { value: 'foreign', label: 'Foreign (Remote)' },
         ]
       : [
+          { value: 'both', label: 'TCP + UDP' },
+          { value: 'tcp', label: 'TCP' },
+          { value: 'udp', label: 'UDP' },
+        ];
 
   return (
     <ModalShell isOpen={isOpen} onClose={onClose} closable={!isLoading} labelledBy="tunnel-title" maxWidth="sm:max-w-xl">

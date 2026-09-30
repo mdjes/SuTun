@@ -5,8 +5,8 @@ import { fetchNodeTunnels, fetchTunnelNodes } from '../services/api';
 /** 'local' = this node only, 'all' = every mesh node, otherwise a single node IP. */
 export type TunnelScope = 'local' | 'all' | string;
 
-export const TUNNEL_TYPES: TunnelType[] = ['realm', 'haproxy', 'iptables', 'gost'];
-const EMPTY: TunnelsData = { haproxy: [], iptables: [], gost: [], realm: [] };
+export const TUNNEL_TYPES: TunnelType[] = ['realm', 'haproxy', 'iptables', 'gost', 'gre', 'sutaw'];
+const EMPTY: TunnelsData = { haproxy: [], iptables: [], gost: [], realm: [], gre: [], sutaw: [] };
 const SCOPE_KEY = 'sutun.tunnels.scope';
 const POLL_MS = 15000;
 
@@ -122,7 +122,7 @@ export function useTunnels(enabled: boolean) {
   const tunnels = useMemo<TunnelsData>(() => {
     const ips =
       scope === 'all' ? Object.keys(byNode) : scope === 'local' ? [localIp || 'local'] : [scope];
-    const out: TunnelsData = { haproxy: [], iptables: [], gost: [], realm: [] };
+    const out: TunnelsData = { haproxy: [], iptables: [], gost: [], realm: [], gre: [], sutaw: [] };
     for (const ip of ips) {
       const d = byNode[ip];
       if (!d) continue;

@@ -121,7 +121,7 @@ export default function App() {
   // Delete confirm state
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{
-    type: 'haproxy' | 'iptables' | 'gost' | 'realm';
+    type: TunnelModalType;
     name: string;
     originNode?: string;
   } | null>(null);
@@ -494,7 +494,7 @@ export default function App() {
   );
 
   const handleDeleteTunnelRequest = useCallback(
-    (type: 'haproxy' | 'iptables' | 'gost' | 'realm', name: string, originNode?: string) => {
+    (type: TunnelModalType, name: string, originNode?: string) => {
       setDeleteTarget({ type, name, originNode });
       setDeleteModalOpen(true);
     },
@@ -514,6 +514,10 @@ export default function App() {
         msg = await api.deleteGostTunnel(deleteTarget.name, deleteTarget.originNode);
       } else if (deleteTarget.type === 'realm') {
         msg = await api.deleteRealmTunnel(deleteTarget.name, deleteTarget.originNode);
+      } else if (deleteTarget.type === 'sutaw') {
+        msg = await api.deleteSutawTunnel(deleteTarget.name, deleteTarget.originNode);
+      } else if (deleteTarget.type === 'gre') {
+        msg = await api.deleteGreTunnel(deleteTarget.name, deleteTarget.originNode);
       }
       addToast(msg || t('toast_deleted'), 'success');
       setDeleteModalOpen(false);

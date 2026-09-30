@@ -552,3 +552,13 @@ export async function fetchNodeUpdateStatus(
 }
 
 
+
+export async function deleteSutawTunnel(name: string, originNode?: string): Promise<string> {
+  const d = await postJson('/api/tunnels/sutaw/delete', { name, origin_node: originNode }, 'Failed to delete SUTAW tunnel');
+  return d.message;
+}
+export async function deleteGreTunnel(name: string, originNode?: string): Promise<string> {
+  const d = await postJson('/api/tunnels/gre/delete', { name, origin_node: originNode }, 'Failed to delete GRE tunnel');
+  return d.message;
+}
+
