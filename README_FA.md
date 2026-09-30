@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/banner-fa-dark.webp" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/1790729801434.webp" />
     <img src="assets/readme/banner-fa-light.webp" alt="SuTun: یک شبکهٔ خصوصی برای همهٔ سرورهای لینوکسی شما" width="100%" />
   </picture>
 </p>
