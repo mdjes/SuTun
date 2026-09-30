@@ -1,6 +1,6 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/banner-en-dark.webp" />
+    <source media="(prefers-color-scheme: dark)" srcset="assets/readme/1790729801434.webp" />
     <img src="assets/readme/banner-en-light.webp" alt="SuTun: one private network for all your Linux servers" width="100%" />
   </picture>
 </p>
