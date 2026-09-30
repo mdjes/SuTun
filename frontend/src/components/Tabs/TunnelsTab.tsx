@@ -7,6 +7,8 @@ import {
   IptablesTunnel,
   GostTunnel,
   RealmTunnel,
+  GreTunnel,
+  SutawTunnel,
 } from '../../types';
 import { TunnelScope } from '../../hooks/useTunnels';
 import { ArrowRight, Boxes, Cpu, Globe, History, Lock, Network, Pencil, Plus, RefreshCw, Search, Server, Trash2, Waypoints, X, Zap } from 'lucide-react';
@@ -30,7 +32,7 @@ import {
   toneSoft,
 } from '../ui';
 
-type AnyTunnel = HaproxyTunnel | IptablesTunnel | GostTunnel | RealmTunnel;
+type AnyTunnel = HaproxyTunnel | IptablesTunnel | GostTunnel | RealmTunnel | GreTunnel | SutawTunnel;
 
 interface TunnelsTabProps {
   tunnels: TunnelsData;
@@ -48,6 +50,10 @@ interface TunnelsTabProps {
   onOpenEditIptables: (t: IptablesTunnel) => void;
   onOpenCreateGost: () => void;
   onOpenEditGost: (t: GostTunnel) => void;
+  onOpenCreateGre: () => void;
+  onOpenEditGre: (t: GreTunnel) => void;
+  onOpenCreateSutaw: () => void;
+  onOpenEditSutaw: (t: SutawTunnel) => void;
   onDeleteTunnel: (type: TunnelType, name: string, originNode?: string) => void;
   t: Translate;
 }
@@ -129,6 +135,30 @@ const SECTIONS: SectionConfig[] = [
     subtabKey: 'tunnels_subtab_gost',
     protocol: (i) => protoLabel((i as GostTunnel).PROTOCOL),
   },
+  {
+    type: 'gre',
+    icon: <Waypoints className="w-[18px] h-[18px]" />,
+    tone: 'neutral',
+    titleKey: 'tunnels_gre_title',
+    descKey: 'tunnels_gre_desc',
+    newKey: 'tunnels_btn_new_gre',
+    emptyKey: 'tunnels_empty_gre',
+    emptyDescKey: 'tunnels_empty_gre_desc',
+    subtabKey: 'tunnels_subtab_gre',
+    protocol: (i) => 'GRE',
+  },
+  {
+    type: 'sutaw',
+    icon: <Waypoints className="w-[18px] h-[18px]" />,
+    tone: 'brand',
+    titleKey: 'tunnels_sutaw_title',
+    descKey: 'tunnels_sutaw_desc',
+    newKey: 'tunnels_btn_new_sutaw',
+    emptyKey: 'tunnels_empty_sutaw',
+    emptyDescKey: 'tunnels_empty_sutaw_desc',
+    subtabKey: 'tunnels_subtab_sutaw',
+    protocol: (i) => 'GRE (NAT)',
+  },
 ];
 
 const Meta: React.FC<{ label: string; value: string }> = ({ label, value }) => (
@@ -152,7 +182,7 @@ function timeAgo(ts: number | null | undefined, t: Translate): string {
 
 function countTunnels(d?: TunnelsData): number {
   if (!d) return 0;
-  return (d.realm?.length || 0) + (d.haproxy?.length || 0) + (d.iptables?.length || 0) + (d.gost?.length || 0);
+  return (d.realm?.length || 0) + (d.haproxy?.length || 0) + (d.iptables?.length || 0) + (d.gost?.length || 0) + (d.gre?.length || 0) + (d.sutaw?.length || 0);
 }
 
 export const TunnelsTab: React.FC<TunnelsTabProps> = ({
@@ -171,6 +201,10 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
   onOpenEditIptables,
   onOpenCreateGost,
   onOpenEditGost,
+  onOpenCreateGre,
+  onOpenEditGre,
+  onOpenCreateSutaw,
+  onOpenEditSutaw,
   onDeleteTunnel,
   t,
 }) => {
@@ -182,6 +216,8 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
     haproxy: { create: onOpenCreateHaproxy, edit: onOpenEditHaproxy },
     iptables: { create: onOpenCreateIptables, edit: onOpenEditIptables },
     gost: { create: onOpenCreateGost, edit: onOpenEditGost },
+    gre: { create: onOpenCreateGre, edit: onOpenEditGre },
+    sutaw: { create: onOpenCreateSutaw, edit: onOpenEditSutaw as any },
   };
 
   const nodeByIp = useMemo(() => new Map(nodes.map((n) => [n.ip, n])), [nodes]);
@@ -202,7 +238,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
       const list = (tunnels[s.type] || []) as AnyTunnel[];
       out[s.type] = q
         ? list.filter((i) =>
-            [i.TUNNEL_NAME, i.TARGET_IP, i.PORT_SPEC, i._node_name, i._node_ip]
+            [i.TUNNEL_NAME || (i as any).NAME, i.TARGET_IP || (i as any).REMOTE_IP, (i as any).PORT_SPEC, i._node_name, i._node_ip]
               .filter(Boolean)
               .some((v) => String(v).toLowerCase().includes(q))
           )
@@ -423,7 +459,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                     const readOnly = !item._is_local && isFailed(node);
                     return (
                       <li
-                        key={`${item._node_ip || 'local'}:${item.TUNNEL_NAME}`}
+                        key={`${item._node_ip || 'local'}:${item.TUNNEL_NAME || (item as any).NAME}`}
                         className={`group flex flex-col gap-3 p-3.5 rounded-xl border border-card-border bg-surface transition-colors hover:border-border-strong ${
                           readOnly ? 'opacity-75' : ''
                         }`}
@@ -431,7 +467,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
                             <p className="font-mono text-sm font-semibold text-text-primary truncate" dir="ltr">
-                              {item.TUNNEL_NAME}
+                              {item.TUNNEL_NAME || (item as any).NAME}
                             </p>
                             {showOrigin && item._node_name && (
                               <p className="flex items-center gap-1 mt-0.5 text-xs text-text-muted min-w-0">
@@ -451,7 +487,7 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handlers[s.type].edit(item)}
-                                aria-label={formatText(t('tunnels_edit_label'), { name: item.TUNNEL_NAME })}
+                                aria-label={formatText(t('tunnels_edit_label'), { name: item.TUNNEL_NAME || (item as any).NAME })}
                                 title={t('btn_edit')}
                                 className={iconBtnSm}
                               >
@@ -459,8 +495,8 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
                               </button>
                               <button
                                 type="button"
-                                onClick={() => onDeleteTunnel(s.type, item.TUNNEL_NAME, item._node_ip)}
-                                aria-label={formatText(t('tunnels_delete_label'), { name: item.TUNNEL_NAME })}
+                                onClick={() => onDeleteTunnel(s.type, item.TUNNEL_NAME || (item as any).NAME, item._node_ip)}
+                                aria-label={formatText(t('tunnels_delete_label'), { name: item.TUNNEL_NAME || (item as any).NAME })}
                                 title={t('btn_delete')}
                                 className={`${iconBtnSm} hover:text-danger hover:bg-danger-subtle`}
                               >
@@ -472,12 +508,14 @@ export const TunnelsTab: React.FC<TunnelsTabProps> = ({
 
                         {/* Route: listen ports on the origin → destination in the mesh */}
                         <div dir="ltr" className="flex items-center gap-2 min-w-0 px-3 py-2 rounded-lg bg-card border border-card-border font-mono text-xs">
-                          <span className="text-text-primary font-medium truncate" title={t('tunnels_col_ports')}>
-                            :{item.PORT_SPEC}
-                          </span>
+                          {s.type !== 'gre' && s.type !== 'sutaw' && (
+                            <span className="text-text-primary font-medium truncate" title={t('tunnels_col_ports')}>
+                              :{(item as any).PORT_SPEC}
+                            </span>
+                          )}
                           <ArrowRight className="w-3.5 h-3.5 shrink-0 text-text-subtle" aria-hidden="true" />
                           <span className="text-text-secondary truncate" title={t('tunnels_col_destination')}>
-                            {item.TARGET_IP || '—'}
+                            {item.TARGET_IP || (item as any).REMOTE_IP || '—'}
                           </span>
                         </div>
 

@@ -759,6 +759,10 @@ export default function App() {
                   onOpenEditGost={(item) => openEditTunnel('gost', item)}
                   onOpenCreateRealm={() => openCreateTunnel('realm')}
                   onOpenEditRealm={(item) => openEditTunnel('realm', item)}
+                  onOpenCreateGre={() => openCreateTunnel('gre')}
+                  onOpenEditGre={(item) => openEditTunnel('gre', item as any)}
+                  onOpenCreateSutaw={() => openCreateTunnel('sutaw')}
+                  onOpenEditSutaw={(item) => openEditTunnel('sutaw', item as any)}
                   onDeleteTunnel={handleDeleteTunnelRequest}
                   t={t}
                 />

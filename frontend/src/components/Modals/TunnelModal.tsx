@@ -9,13 +9,13 @@ import { FieldError } from '../NodeConfig/FormControls';
 import { btnPrimary, btnSecondary, Callout, hintClass, inputClass, labelClass, Pill, Segmented, selectClass, toneSoft, Tone } from '../ui';
 import { ModalClose, ModalShell } from './ModalShell';
 
-export type TunnelModalType = 'haproxy' | 'iptables' | 'gost' | 'realm';
+export type TunnelModalType = 'haproxy' | 'iptables' | 'gost' | 'realm' | 'sutaw';
 
 interface TunnelModalProps {
   isOpen: boolean;
   type: TunnelModalType;
   isEdit: boolean;
-  initialData?: HaproxyTunnel | IptablesTunnel | GostTunnel | RealmTunnel | null;
+  initialData?: HaproxyTunnel | IptablesTunnel | GostTunnel | RealmTunnel | any | null;
   peers: Peer[];
   /** Per-node reachability from the tunnels view, used to flag unreachable origins. */
   nodeStates?: TunnelNodeState[];
@@ -32,6 +32,7 @@ const ENGINES: Record<TunnelModalType, { name: string; icon: React.ReactNode; to
   haproxy: { name: 'HAProxy', icon: <Network className="w-5 h-5" />, tone: 'primary', desc: 'tunnels_haproxy_desc' },
   iptables: { name: 'iptables', icon: <Boxes className="w-5 h-5" />, tone: 'info', desc: 'tunnels_iptables_desc' },
   gost: { name: 'GOST', icon: <Zap className="w-5 h-5" />, tone: 'warning', desc: 'tunnels_gost_desc' },
+  sutaw: { name: 'SUTAW-Gre', icon: <Network className="w-5 h-5" />, tone: 'brand', desc: 'tunnels_sutaw_desc' },
 };
 
 const PRESETS: Record<TunnelModalType, { val: string; key: TranslationKey }[]> = {
@@ -63,6 +64,7 @@ const PRESETS: Record<TunnelModalType, { val: string; key: TranslationKey }[]> =
     { val: '8000-8010', key: 'preset_range' },
     { val: '1080', key: 'preset_socks' },
   ],
+  sutaw: [],
 };
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$/;
@@ -176,13 +178,16 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
         setProtocol((initialData as GostTunnel).PROTOCOL || 'both');
       } else if (type === 'realm') {
         setProtocol((initialData as RealmTunnel).PROTOCOL || 'both');
+      } else if (type === 'sutaw') {
+        setProtocol(initialData.ROLE || 'iran');
+        setTarget(initialData.REMOTE_IP || '');
       }
     } else {
       setName('');
       setOriginNode(type === 'iptables' ? '' : defaultOriginNode);
       setTarget('');
       setPorts('');
-      setProtocol(type === 'gost' || type === 'realm' ? 'both' : 'udp');
+      setProtocol(type === 'gost' || type === 'realm' ? 'both' : type === 'sutaw' ? 'iran' : 'udp');
       setIface('any');
       setSourceCidr('0.0.0.0/0');
     }
@@ -206,12 +211,16 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
       setError(t('modal_tunnel_iptables_remote_notice'));
       return;
     }
-    if (!name.trim() || !target.trim() || !ports.trim()) {
+    if (!name.trim() || !target.trim() || (type !== 'sutaw' && !ports.trim())) {
       setError(t('tunnel_err_required'));
       return;
     }
     if (!NAME_PATTERN.test(name.trim())) {
       setError(t('tunnel_err_name'));
+      return;
+    }
+    if (type === 'sutaw' && !['iran', 'foreign'].includes(protocol)) {
+      setError('Invalid role for SUTAW.');
       return;
     }
     setError(null);
@@ -227,6 +236,8 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
         interface: iface,
         sourceCidr: sourceCidr.trim(),
         source_cidr: sourceCidr.trim(),
+        role: type === 'sutaw' ? protocol : undefined,
+        remote_ip: type === 'sutaw' ? target.trim() : undefined,
       });
       onClose();
     } catch (err: any) {
@@ -247,7 +258,13 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
           { value: 'both', label: 'TCP + UDP' },
           { value: 'tcp', label: 'TCP' },
           { value: 'udp', label: 'UDP' },
-        ];
+        ]
+      : type === 'sutaw'
+      ? [
+          { value: 'iran', label: 'Iran (Local)' },
+          { value: 'foreign', label: 'Foreign (Remote)' },
+        ]
+      : [
 
   return (
     <ModalShell isOpen={isOpen} onClose={onClose} closable={!isLoading} labelledBy="tunnel-title" maxWidth="sm:max-w-xl">
@@ -355,7 +372,7 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
         {/* Destination */}
         <div className="flex flex-col gap-1.5">
           <label htmlFor={`${id}-target`} className={labelClass}>
-            {t('modal_tunnel_dest')}
+            {type === 'sutaw' ? 'Remote IP' : t('modal_tunnel_dest')}
           </label>
           <div className={`grid gap-2 ${destinations.length > 0 ? 'grid-cols-1 sm:grid-cols-2' : 'grid-cols-1'}`}>
             {destinations.length > 0 && (
@@ -406,6 +423,7 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
         )}
 
         {/* Ports */}
+        {type !== 'sutaw' && (
         <div className="flex flex-col gap-1.5">
           <label htmlFor={`${id}-ports`} className={labelClass}>
             {t('modal_tunnel_ports')}
@@ -450,6 +468,7 @@ export const TunnelModal: React.FC<TunnelModalProps> = ({
             })}
           </div>
         </div>
+        )}
 
         {/* iptables: inbound interface and allowed sources */}
         {type === 'iptables' && (

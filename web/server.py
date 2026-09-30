@@ -39,7 +39,7 @@ import functools
 from pathlib import Path
 
 # Paths & Defaults
-CURRENT_VERSION = "3.1.0"
+CURRENT_VERSION = "3.2.0"
 CURRENT_BRANCH = "main"
 INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/sutun")
 BIN_DIR = os.path.join(INSTALL_DIR, "bin")
@@ -52,6 +52,7 @@ HAPROXY_DIR = os.environ.get("HAPROXY_DIR", "/etc/sutun/haproxy-tunnels")
 IPTABLES_DIR = os.environ.get("IPTABLES_DIR", "/etc/sutun/iptables-tunnels")
 GOST_TUNNEL_DIR = os.environ.get("GOST_TUNNEL_DIR", "/etc/sutun/gost-tunnels")
 REALM_TUNNEL_DIR = os.environ.get("REALM_TUNNEL_DIR", "/etc/sutun/realm-tunnels")
+GRE_TUNNEL_DIR = os.environ.get("GRE_TUNNEL_DIR", "/etc/sutun/gre-tunnels")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 PORT = int(os.environ.get("WEB_PORT", "11080"))
@@ -750,8 +751,8 @@ def get_easytier_routes():
 
 
 def get_tunnels():
-    """Read HAProxy, iptables, GOST, and Realm configured tunnels."""
-    tunnels = {"haproxy": [], "iptables": [], "gost": [], "realm": []}
+    """Read HAProxy, iptables, GOST, Realm, GRE, and SUTAW configured tunnels."""
+    tunnels = {"haproxy": [], "iptables": [], "gost": [], "realm": [], "gre": [], "sutaw": []}
 
     # HAProxy tunnels
     if os.path.isdir(HAPROXY_DIR):
@@ -785,7 +786,22 @@ def get_tunnels():
                 if data:
                     tunnels["realm"].append(data)
 
+    # GRE tunnels
+    if os.path.isdir(GRE_TUNNEL_DIR):
+        for fname in os.listdir(GRE_TUNNEL_DIR):
+            if fname.endswith(".env"):
+                data = load_env_file(os.path.join(GRE_TUNNEL_DIR, fname))
+                if data:
+                    tunnels["gre"].append(data)
+
     # Check systemd status
+    # SUTAW tunnels
+    sutaw_conf = "/etc/sutun/sutaw-tunnels/config.env"
+    if os.path.exists(sutaw_conf):
+        data = load_env_file(sutaw_conf)
+        if data:
+            tunnels["sutaw"].append(data)
+
     def check_service(name):
         try:
             r = subprocess.run(["systemctl", "is-active", name], stdout=subprocess.PIPE, text=True)
@@ -797,6 +813,8 @@ def get_tunnels():
     tunnels["iptables_service"] = check_service("sutun-iptables.service")
     tunnels["gost_service"] = check_service("sutun-gost.service")
     tunnels["realm_service"] = check_service("sutun-realm.service")
+    tunnels["gre_service"] = check_service("sutaw-gre.service")
+    tunnels["sutaw_service"] = check_service("sutaw-gre.service")
     tunnels["iperf_service"] = check_service("sutun-iperf.service")
 
     return tunnels
@@ -1923,7 +1941,7 @@ def is_local_origin(origin_node):
     return bool(local_ip and origin == local_ip)
 
 
-TUNNEL_TYPES = ("haproxy", "iptables", "gost", "realm")
+TUNNEL_TYPES = ("haproxy", "iptables", "gost", "realm", "gre", "sutaw")
 TUNNEL_CACHE = {}  # peer ip -> {"tunnels": {...}, "name": str, "fetched_at": ts}
 TUNNEL_CACHE_LOCK = threading.Lock()
 TUNNEL_FETCH_TIMEOUT = 3.0
@@ -2012,8 +2030,8 @@ def fetch_remote_tunnels(peer):
     return tunnel_cache_fallback(peer, status, error)
 
 
-TUNNEL_ACTION_RE = re.compile(r"^/api/tunnels/(haproxy|iptables|gost|realm)/(create|edit|delete)$")
-TUNNEL_ENGINE_LABELS = {"haproxy": "HAProxy", "iptables": "iptables", "gost": "GOST", "realm": "Realm"}
+TUNNEL_ACTION_RE = re.compile(r"^/api/tunnels/(haproxy|iptables|gost|realm|gre|sutaw)/(create|edit|delete)$")
+TUNNEL_ENGINE_LABELS = {"haproxy": "HAProxy", "iptables": "iptables", "gost": "GOST", "realm": "Realm", "gre": "GRE", "sutaw": "SUTAW"}
 TUNNEL_ACTION_DONE = {"create": "created", "edit": "updated", "delete": "deleted"}
 TUNNEL_NAME_ERROR = "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."
 # The first tunnel of an engine installs it (apt packages plus a binary download), which can take minutes.
@@ -2062,6 +2080,56 @@ def build_tunnel_command(t_type, action, data):
 
 def run_tunnel_command(t_type, action, data):
     """Apply a tunnel change on this node; returns (ok, message)."""
+    if t_type == "sutaw":
+        role = tunnel_field(data, "role").lower()
+        remote_ip = tunnel_field(data, "remote_ip")
+        
+        script_path = "/usr/local/bin/mdtun"
+        if not os.path.exists(script_path):
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sutaw-gre.sh")
+            
+        if action == "delete":
+            cmd = ["bash", script_path, "--non-interactive", "3"]
+        else:
+            if role not in ("iran", "foreign"):
+                return False, "Role must be 'iran' or 'foreign'."
+            if not IPV4_RE.match(remote_ip):
+                return False, "Invalid remote IP."
+            option = "1" if role == "iran" else "2"
+            local_ip = load_env_file(CONFIG_FILE).get("PUBLIC_IPV4", "")
+            if not local_ip:
+                # Fallback to fetching it
+                try:
+                    local_ip = urllib.request.urlopen("https://api.ipify.org", timeout=5).read().decode("utf-8").strip()
+                except:
+                    local_ip = "127.0.0.1"
+                    
+            if option == "1":
+                ip_iran = local_ip
+                ip_foreign = remote_ip
+            else:
+                ip_iran = remote_ip
+                ip_foreign = local_ip
+            cmd = ["bash", script_path, "--non-interactive", option, ip_iran, ip_foreign]
+            
+        with TUNNEL_CMD_LOCK:
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TUNNEL_CMD_TIMEOUT)
+                if proc.returncode == 0:
+                    conf_dir = "/etc/sutun/sutaw-tunnels"
+                    os.makedirs(conf_dir, exist_ok=True)
+                    if action == "delete":
+                        if os.path.exists(os.path.join(conf_dir, "config.env")):
+                            os.remove(os.path.join(conf_dir, "config.env"))
+                    else:
+                        with open(os.path.join(conf_dir, "config.env"), "w") as f:
+                            f.write(f"ROLE={role}\nREMOTE_IP={remote_ip}\nNAME=SUTAW-Gre\nTARGET={remote_ip}\n")
+                    return True, f"SUTAW tunnel {TUNNEL_ACTION_DONE[action]} successfully."
+                else:
+                    return False, f"Failed to configure SUTAW: {proc.stderr.strip() or proc.stdout.strip()}"
+            except Exception as e:
+                return False, f"Error running SUTAW command: {e}"
+
     args, err = build_tunnel_command(t_type, action, data)
     if not args:
         return False, err

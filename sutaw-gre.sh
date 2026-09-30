@@ -64,7 +64,29 @@ echo "8 - SECURE Server (Anti-DDoS, Anti-Spoof, Fail2ban)"
 echo "9 - EXIT"
 echo
 
-read -p "Enter a number (1-9): " OPTION
+if [[ "$1" == "--non-interactive" ]]; then
+    OPTION="$2"
+    if [[ "$OPTION" == "1" || "$OPTION" == "2" ]]; then
+        IP_IRAN="$3"
+        IP_FOREIGN="$4"
+        if [[ -z "$IP_IRAN" || -z "$IP_FOREIGN" ]]; then
+            echo -e "${RED}[!] Server IPs cannot be empty.${RESET}"
+            exit 1
+        fi
+    fi
+else
+    read -p "Enter a number (1-9): " OPTION
+
+    if [[ "$OPTION" == "1" || "$OPTION" == "2" ]]; then
+        read -p "Enter IRAN server IP: " IP_IRAN
+        read -p "Enter FOREIGN server IP: " IP_FOREIGN
+        
+        if [[ -z "$IP_IRAN" || -z "$IP_FOREIGN" ]]; then
+            echo -e "${RED}[!] Server IPs cannot be empty.${RESET}"
+            exit 1
+        fi
+    fi
+fi
 
 # ==========================================
 # Helper Function: Create Systemd Service
@@ -95,16 +117,6 @@ EOF
 if [[ "$OPTION" == "9" ]]; then
     echo -e "${YELLOW}[*] Exiting...${RESET}"
     exit 0
-fi
-
-if [[ "$OPTION" == "1" || "$OPTION" == "2" ]]; then
-    read -p "Enter IRAN server IP: " IP_IRAN
-    read -p "Enter FOREIGN server IP: " IP_FOREIGN
-    
-    if [[ -z "$IP_IRAN" || -z "$IP_FOREIGN" ]]; then
-        echo -e "${RED}[!] Server IPs cannot be empty.${RESET}"
-        exit 1
-    fi
 fi
 
 if [[ "$OPTION" == "1" ]]; then

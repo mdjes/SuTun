@@ -117,18 +117,40 @@ export interface RealmTunnel {
   _is_local?: boolean;
 }
 
+export interface GreTunnel {
+  TUNNEL_NAME: string;
+  TARGET_IP: string;
+  LOCAL_IP?: string;
+  _node_ip?: string;
+  _node_name?: string;
+  _is_local?: boolean;
+}
+
+export interface SutawTunnel {
+  NAME: string;
+  ROLE: string;
+  REMOTE_IP: string;
+  _node_ip?: string;
+  _node_name?: string;
+  _is_local?: boolean;
+}
+
 export interface TunnelsData {
   haproxy: HaproxyTunnel[];
   iptables: IptablesTunnel[];
   gost: GostTunnel[];
   realm: RealmTunnel[];
+  gre: GreTunnel[];
+  sutaw: SutawTunnel[];
   haproxy_service?: string;
   iptables_service?: string;
   gost_service?: string;
   realm_service?: string;
+  gre_service?: string;
+  sutaw_service?: string;
 }
 
-export type TunnelType = 'realm' | 'haproxy' | 'iptables' | 'gost';
+export type TunnelType = 'realm' | 'haproxy' | 'iptables' | 'gost' | 'gre' | 'sutaw';
 
 /** idle = not requested yet (outside the current scope); the rest after ok are failure codes from the server. */
 export type TunnelNodeStatus = 'idle' | 'ok' | 'unreachable' | 'timeout' | 'auth_failed' | 'unsupported' | 'remote_error';
