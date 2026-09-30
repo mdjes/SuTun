@@ -1,0 +1,4300 @@
+#!/usr/bin/env python3
+"""
+SuTun Web UI Daemon & API Server
+Developed by mdjes
+
+A lightweight, zero-dependency Python 3 HTTP server providing:
+- Real-time Mesh & Node Monitoring
+- In-Mesh Speedtest & iperf3 Benchmarking (TCP / UDP)
+- Interactive Latency / Ping Diagnostics
+- Hybrid Authentication (One-Time Token & Admin Password)
+"""
+
+import http.server
+import socketserver
+import json
+import os
+import sys
+import subprocess
+import urllib.parse
+import urllib.request
+import base64
+import time
+import uuid
+import hashlib
+import hmac
+import secrets
+import re
+import signal
+import socket
+import threading
+import traceback
+import shutil
+import concurrent.futures
+import ipaddress
+import ssl
+import struct
+import zlib
+import functools
+from pathlib import Path
+
+# Paths & Defaults
+CURRENT_VERSION = "3.1.0"
+CURRENT_BRANCH = "main"
+INSTALL_DIR = os.environ.get("INSTALL_DIR", "/opt/sutun")
+BIN_DIR = os.path.join(INSTALL_DIR, "bin")
+CONFIG_FILE = os.environ.get("CONFIG_FILE", "/etc/sutun/config.env")
+CONFIG_BACKUP_FILE = CONFIG_FILE + ".bak"
+CONFIG_STAGED_FILE = CONFIG_FILE + ".staged"
+WEB_ENV_FILE = os.environ.get("WEB_ENV_FILE", "/etc/sutun/web.env")
+WEB_TOKEN_FILE = os.environ.get("WEB_TOKEN_FILE", "/etc/sutun/web-tokens.json")
+HAPROXY_DIR = os.environ.get("HAPROXY_DIR", "/etc/sutun/haproxy-tunnels")
+IPTABLES_DIR = os.environ.get("IPTABLES_DIR", "/etc/sutun/iptables-tunnels")
+GOST_TUNNEL_DIR = os.environ.get("GOST_TUNNEL_DIR", "/etc/sutun/gost-tunnels")
+REALM_TUNNEL_DIR = os.environ.get("REALM_TUNNEL_DIR", "/etc/sutun/realm-tunnels")
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+PORT = int(os.environ.get("WEB_PORT", "11080"))
+BIND_ADDR = os.environ.get("WEB_BIND", "0.0.0.0")
+SESSION_COOKIE_NAME = "sutun_session"
+SESSION_DURATION_SEC = 86400 * 7  # 7 days
+
+# In-Memory Active Sessions & Tokens
+SESSIONS = {}  # session_id -> {"expires": timestamp, "user": "admin"}
+SESSION_LOCK = False
+
+# Version & Release Caching
+VERSION_CACHE = {}  # branch -> {"data": version info, "last_checked": ts}
+VERSION_CACHE_TTL = 300  # 5 minutes
+VERSION_FAIL_TTL = 60  # a failed check is retried soon instead of posing as "up to date"
+VERSION_REFRESHING = set()  # branches with a background refresh in flight
+PEER_VERSION_CACHE = {}  # ip -> {"version": ver, "timestamp": ts}
+
+UPDATE_STATUS_FILE = os.environ.get("SUTUN_UPDATE_STATUS_FILE", "/var/lib/sutun/update-status.json")
+UPDATE_STALE_SEC = 900  # a job that stops reporting for this long is treated as failed
+UPDATE_QUEUED_STALE_SEC = 90  # a queued job the updater never picked up
+
+
+def is_ssl_enabled():
+    """Check if valid SSL cert and key exist for Web UI."""
+    web_cfg = load_env_file(WEB_ENV_FILE)
+    cert = os.environ.get("WEB_SSL_CERT") or web_cfg.get("WEB_SSL_CERT", "")
+    key = os.environ.get("WEB_SSL_KEY") or web_cfg.get("WEB_SSL_KEY", "")
+    return bool(cert and key and os.path.isfile(cert) and os.path.isfile(key))
+
+
+def get_active_branch():
+    """Branch for version checks and downloads: always main. The beta channel was removed,
+    so an SUTUN_BRANCH left in web.env by a beta install is ignored."""
+    return CURRENT_BRANCH
+
+
+def parse_semver(v):
+    """Parse semver string supporting pre-release tags, e.g. 2.2.6-beta.1."""
+    s = str(v).strip().lstrip('v')
+    m = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-?([a-zA-Z]+)(?:\.?(\d+))?)?', s)
+    if not m:
+        return (0, 0, 0, 0, "", 0)
+    major = int(m.group(1) or 0)
+    minor = int(m.group(2) or 0)
+    patch = int(m.group(3) or 0)
+    tag = m.group(4)
+    tag_num = int(m.group(5) or 0)
+    is_release = 1 if tag is None else 0
+    tag_str = (tag or "").lower()
+    return (major, minor, patch, is_release, tag_str, tag_num)
+
+
+def is_newer_version(remote_ver, local_ver):
+    """Compare semver strings with pre-release awareness (e.g. 2.2.6-beta.2 vs 2.2.6-beta.1)."""
+    try:
+        r = parse_semver(remote_ver)
+        l = parse_semver(local_ver)
+        if r[:3] != l[:3]:
+            return r[:3] > l[:3]
+        if r[3] != l[3]:
+            return r[3] > l[3]
+        if r[4] != l[4]:
+            return r[4] > l[4]
+        return r[5] > l[5]
+    except Exception:
+        return False
+
+
+def get_version_info(branch=None, force=False):
+    """Fetch version info from the branch's version.json, cached per branch (failed checks only briefly)."""
+    now = time.time()
+    branch = branch or get_active_branch()
+    cached = VERSION_CACHE.get(branch)
+    ttl = VERSION_CACHE_TTL if cached and cached.get("data", {}).get("checked") else VERSION_FAIL_TTL
+    if not force and cached and cached.get("data") and (now - cached.get("last_checked", 0) < ttl):
+        # Compare against the running version at read time; it changes after a self-update.
+        data = dict(cached["data"])
+        data["current_version"] = CURRENT_VERSION
+        data["update_available"] = is_newer_version(data.get("latest_version", ""), CURRENT_VERSION)
+        return data
+
+    remote_data = None
+    url = f"https://raw.githubusercontent.com/mdjes/SuTun/{branch}/version.json?t={int(now)}"
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "User-Agent": f"SuTun-Web/{CURRENT_VERSION} ({branch})"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            if resp.status == 200:
+                remote_data = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+
+    if not isinstance(remote_data, dict):
+        previous = (cached or {}).get("data") or {}
+        if previous.get("latest_version") and previous.get("checked_at"):
+            # Keep the last good answer, but retry soon.
+            data = dict(previous, current_version=CURRENT_VERSION, checked=False, check_failed_at=now)
+            data["update_available"] = is_newer_version(data["latest_version"], CURRENT_VERSION)
+            VERSION_CACHE[branch] = {"data": data, "last_checked": now}
+            return data
+
+    # Unknown until GitHub answers; never report "up to date" from a failed check.
+    latest_ver = ""
+    changelog = []
+    update_cmd = f"bash <(curl -fsSL https://raw.githubusercontent.com/mdjes/SuTun/{branch}/sutun.sh) update"
+    release_notes = ""
+
+    if isinstance(remote_data, dict):
+        latest_ver = remote_data.get("version", CURRENT_VERSION)
+        changelog = remote_data.get("changelog", [])
+        update_cmd = remote_data.get("update_command", update_cmd)
+        release_notes = remote_data.get("release_notes", "")
+
+    result = {
+        "current_version": CURRENT_VERSION,
+        "latest_version": latest_ver,
+        "branch": branch,
+        "update_available": is_newer_version(latest_ver, CURRENT_VERSION),
+        "changelog": changelog,
+        "release_notes": release_notes,
+        "update_command": update_cmd,
+        "checked": isinstance(remote_data, dict),
+        "checked_at": now if isinstance(remote_data, dict) else None,
+    }
+    VERSION_CACHE[branch] = {"data": result, "last_checked": now}
+    return result
+
+
+def get_cached_version_info():
+    """Non-blocking variant for latency-sensitive probes: serve the cache and refresh it in the background."""
+    branch = get_active_branch()
+    cached = VERSION_CACHE.get(branch) or {}
+    ttl = VERSION_CACHE_TTL if (cached.get("data") or {}).get("checked") else VERSION_FAIL_TTL
+    fresh = cached.get("data") and time.time() - cached.get("last_checked", 0) < ttl
+    if not fresh and branch not in VERSION_REFRESHING:
+        VERSION_REFRESHING.add(branch)
+
+        def refresh():
+            try:
+                get_version_info(branch)
+            finally:
+                VERSION_REFRESHING.discard(branch)
+
+        threading.Thread(target=refresh, daemon=True).start()
+    return cached.get("data")
+
+
+def read_update_status():
+    """Last self-update job recorded by sutun.sh, with stalled jobs reported as failed."""
+    try:
+        with open(UPDATE_STATUS_FILE, "r", encoding="utf-8") as f:
+            status = json.load(f)
+    except Exception:
+        return {"state": "idle"}
+    if not isinstance(status, dict):
+        return {"state": "idle"}
+    last_seen = status.get("updated_at") or status.get("started_at") or 0
+    age = time.time() - last_seen
+    if status.get("state") == "queued" and age > UPDATE_QUEUED_STALE_SEC:
+        # The updater reports within seconds of starting; a job still queued never ran.
+        # Failing it here also stops it from blocking the next attempt as "already running".
+        status["state"] = "failed"
+        status["error"] = status.get("error") or "The updater never started. Check journalctl -u sutun-updater-temp -n 50 or /var/log/sutun-update.log."
+    elif status.get("state") in ("queued", "running") and age > UPDATE_STALE_SEC:
+        status["state"] = "failed"
+        status["error"] = status.get("error") or "The updater stopped reporting progress. Check /var/log/sutun-update.log or journalctl -u sutun-updater-temp."
+    return status
+
+
+def write_update_status(status):
+    """Record an update job state from the web side (queued / failed to launch)."""
+    os.makedirs(os.path.dirname(UPDATE_STATUS_FILE), exist_ok=True)
+    tmp = UPDATE_STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(status, f)
+    os.replace(tmp, UPDATE_STATUS_FILE)
+
+
+def update_job_running():
+    return read_update_status().get("state") in ("queued", "running")
+
+
+def local_update_summary():
+    """Version and update job of this server, as shown in every panel of the mesh."""
+    info = get_cached_version_info() or {}
+    branch = get_active_branch()
+    latest = info.get("latest_version") or ""
+    job = read_update_status()
+    return {
+        "version": CURRENT_VERSION,
+        "branch": branch,
+        # Always "stable" now; older panels read the key's presence as "tracked updater".
+        "channel": "stable",
+        "latest_version": latest,
+        "update_available": bool(latest) and is_newer_version(latest, CURRENT_VERSION),
+        "update_checked": bool(info.get("checked")),
+        "update": {k: job.get(k) for k in ("state", "step", "target_version", "error", "rolled_back", "started_at", "finished_at")},
+    }
+
+
+def normalize_network_interfaces(raw_interfaces):
+    """Return a validated, de-duplicated interface list with any first."""
+    if not isinstance(raw_interfaces, (list, tuple, set)):
+        return []
+
+    interfaces = []
+    for raw_interface in raw_interfaces:
+        if not isinstance(raw_interface, str):
+            continue
+        interface = raw_interface.strip()
+        if interface and interface not in interfaces:
+            interfaces.append(interface)
+
+    if interfaces:
+        if "any" in interfaces:
+            interfaces.remove("any")
+        interfaces.insert(0, "any")
+    return interfaces
+
+
+def get_peer_port_candidates(peer_ip, preferred_port=None):
+    """Build a stable, de-duplicated Web UI port list for a mesh peer."""
+    cached_peer = PEER_VERSION_CACHE.get(peer_ip, {})
+    ports = []
+    for candidate in (preferred_port, cached_peer.get("port"), PORT):
+        try:
+            port = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 65535 and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def fetch_peer_cluster_info(peer_ip, preferred_port=None, timeout=1.0, strict_port=False):
+    """Fetch public cluster metadata, preserving the responsive peer port."""
+    insecure_ssl_ctx = ssl.create_default_context()
+    insecure_ssl_ctx.check_hostname = False
+    insecure_ssl_ctx.verify_mode = ssl.CERT_NONE
+    schemes = ("https", "http") if is_ssl_enabled() else ("http", "https")
+    last_err = "Failed to connect to cluster peer"
+
+    if strict_port and preferred_port:
+        try:
+            ports_to_try = [int(preferred_port)]
+        except (TypeError, ValueError):
+            ports_to_try = get_peer_port_candidates(peer_ip, preferred_port)
+    else:
+        ports_to_try = get_peer_port_candidates(peer_ip, preferred_port)
+    for port in ports_to_try:
+        for scheme in schemes:
+            url = f"{scheme}://{peer_ip}:{port}/api/cluster/info"
+            req = urllib.request.Request(url, headers={"User-Agent": f"SuTun-Cluster/{CURRENT_VERSION}"})
+            try:
+                ctx = insecure_ssl_ctx if scheme == "https" else None
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if isinstance(data, dict) and data.get("ok") is True and data.get("version"):
+                        return data, port, ""
+            except urllib.error.HTTPError as error:
+                last_err = f"HTTP {error.code}"
+            except Exception as error:
+                last_err = str(error)
+
+    return {}, None, last_err
+
+
+def get_peer_version(peer_ip, port=None, timeout=1.0):
+    """Probe peer's /api/cluster/info or cached version across candidate ports."""
+    now = time.time()
+    cached = PEER_VERSION_CACHE.get(peer_ip, {})
+    # Unreachable results expire sooner, so a peer that just came up shows its version quickly
+    # without re-probing offline peers (seconds of timeouts) on every poll.
+    # Same for a peer that has not finished checking its own channel for updates yet.
+    incomplete = cached.get("version") in (None, "", "unknown") or ("channel" in cached and not cached.get("latest_version"))
+    ttl = 15.0 if incomplete else 60.0
+    if cached and (now - cached.get("timestamp", 0) < ttl) and cached.get("version"):
+        return cached.get("version", "unknown")
+
+    peer_info, responsive_port, _ = fetch_peer_cluster_info(peer_ip, port, timeout)
+    version_found = peer_info.get("version") if peer_info else None
+    if not version_found:
+        prev_ver = cached.get("version")
+        if prev_ver and prev_ver not in ("legacy (< 2.0.0)", "unknown"):
+            version_found = prev_ver
+        else:
+            version_found = "unknown"
+
+    peer_branch = (peer_info.get("branch") if peer_info else None) or cached.get("branch") or ""
+    cache_entry = {
+        "version": version_found,
+        "port": responsive_port or cached.get("port") or port or PORT,
+        "interfaces": normalize_network_interfaces(
+            (peer_info.get("interfaces") if peer_info else None) or cached.get("interfaces")
+        ),
+        "timestamp": now
+    }
+    if peer_branch:
+        cache_entry["branch"] = peer_branch
+    # Peers from 2.2.6-beta.5 on report their own channel, latest release and update job.
+    source = peer_info if peer_info else cached
+    for key in ("channel", "latest_version", "update_available", "update_checked", "update"):
+        if key in source:
+            cache_entry[key] = source[key]
+    PEER_VERSION_CACHE[peer_ip] = cache_entry
+    return version_found
+
+
+def load_env_file(filepath):
+    """Safely parse shell-style .env file."""
+    res = {}
+    if not os.path.isfile(filepath):
+        return res
+    try:
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                v = re.sub(r'\\([, \t\'\"])', r'\1', v)
+                res[k] = v
+    except Exception:
+        pass
+    return res
+
+
+def hash_password(password, salt=None):
+    """Hash password using SHA-256 with salt."""
+    if not salt:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+    return f"sha256${salt}${hashed}"
+
+
+def verify_password(password, stored_hash):
+    """Verify password against stored sha256$salt$hash."""
+    try:
+        parts = stored_hash.split("$")
+        if len(parts) != 3 or parts[0] != "sha256":
+            return False
+        salt, target_hash = parts[1], parts[2]
+        computed = hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+        return secrets.compare_digest(computed, target_hash)
+    except Exception:
+        return False
+
+
+def load_tokens():
+    """Load valid one-time/access tokens from file."""
+    if not os.path.isfile(WEB_TOKEN_FILE):
+        return {}
+    try:
+        with open(WEB_TOKEN_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            now = time.time()
+            return {k: v for k, v in data.items() if v.get("expires", 0) > now}
+    except Exception:
+        return {}
+
+
+def save_tokens(tokens):
+    """Save tokens to file with secure permissions."""
+    try:
+        os.makedirs(os.path.dirname(WEB_TOKEN_FILE), exist_ok=True)
+        with open(WEB_TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(tokens, f, indent=2)
+        try:
+            os.chmod(WEB_TOKEN_FILE, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def validate_token(token_str):
+    """Validate a token and remove it if one-time use."""
+    if not token_str:
+        return False
+    tokens = load_tokens()
+    if token_str in tokens:
+        info = tokens[token_str]
+        if info.get("expires", 0) > time.time():
+            if info.get("one_time", True):
+                del tokens[token_str]
+                save_tokens(tokens)
+            return True
+    return False
+
+
+def is_authenticated(headers, query_params=None):
+    """Check if request is authenticated via session cookie or direct query token."""
+    # 1. Check query parameter token
+    if query_params and "token" in query_params:
+        token = query_params["token"]
+        if validate_token(token):
+            return True, "token"
+
+    # 2. Check session cookie
+    cookie_header = headers.get("Cookie", "")
+    if cookie_header:
+        for item in cookie_header.split(";"):
+            item = item.strip()
+            if item.startswith(f"{SESSION_COOKIE_NAME}="):
+                session_id = item.split("=", 1)[1]
+                if session_id in SESSIONS:
+                    sess = SESSIONS[session_id]
+                    if sess.get("expires", 0) > time.time():
+                        return True, session_id
+                    else:
+                        del SESSIONS[session_id]
+
+    # 3. If neither password nor tokens are set, check if web.env has password configured
+    web_cfg = load_env_file(WEB_ENV_FILE)
+    has_password = bool(web_cfg.get("WEB_PASSWORD_HASH"))
+    tokens = load_tokens()
+
+    # If system has zero password and zero tokens, require generating a token via CLI for security
+    if not has_password and not tokens:
+        return False, None
+
+    return False, None
+
+
+def create_session():
+    """Create a new session ID with expiry."""
+    session_id = secrets.token_hex(32)
+    SESSIONS[session_id] = {
+        "expires": time.time() + SESSION_DURATION_SEC,
+        "created": time.time(),
+        "user": "admin"
+    }
+    return session_id
+
+
+def get_session_cookie(session_id):
+    """Generate Set-Cookie header value with security attributes."""
+    secure_flag = "; Secure" if is_ssl_enabled() else ""
+    return f"{SESSION_COOKIE_NAME}={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_DURATION_SEC}{secure_flag}"
+
+
+# Login Rate Limiting (In-Memory IP tracking)
+LOGIN_ATTEMPTS = {}  # ip -> [timestamp, ...]
+LOGIN_RATE_LIMIT = 5  # max failed attempts
+LOGIN_RATE_WINDOW = 60  # window in seconds
+LOGIN_ATTEMPTS_LOCK = threading.Lock()
+
+
+def check_login_rate_limit(ip):
+    """Return (allowed: bool, retry_after: int) for IP address."""
+    now = time.time()
+    with LOGIN_ATTEMPTS_LOCK:
+        attempts = [ts for ts in LOGIN_ATTEMPTS.get(ip, []) if now - ts < LOGIN_RATE_WINDOW]
+        LOGIN_ATTEMPTS[ip] = attempts
+        if len(attempts) >= LOGIN_RATE_LIMIT:
+            retry_after = max(1, int(LOGIN_RATE_WINDOW - (now - attempts[0])))
+            return False, retry_after
+        return True, 0
+
+
+def record_failed_login(ip):
+    """Record a failed login attempt for rate limiting."""
+    now = time.time()
+    with LOGIN_ATTEMPTS_LOCK:
+        attempts = [ts for ts in LOGIN_ATTEMPTS.get(ip, []) if now - ts < LOGIN_RATE_WINDOW]
+        attempts.append(now)
+        LOGIN_ATTEMPTS[ip] = attempts
+
+
+def reset_login_attempts(ip):
+    """Clear failed login records for IP upon successful authentication."""
+    with LOGIN_ATTEMPTS_LOCK:
+        LOGIN_ATTEMPTS.pop(ip, None)
+
+
+_last_cpu_sample = {"total": 0.0, "idle": 0.0, "time": 0.0}
+
+
+def read_proc_stat_cpu():
+    """Read total and idle CPU times from /proc/stat."""
+    if not os.path.isfile("/proc/stat"):
+        return None, None
+    try:
+        with open("/proc/stat", "r") as f:
+            for line in f:
+                if line.startswith("cpu "):
+                    parts = [float(x) for x in line.split()[1:]]
+                    idle = parts[3] + (parts[4] if len(parts) > 4 else 0.0)
+                    total = sum(parts)
+                    return total, idle
+    except Exception:
+        pass
+    return None, None
+
+
+def get_cpu_percent():
+    """Compute CPU usage percent using /proc/stat delta."""
+    global _last_cpu_sample
+    total_now, idle_now = read_proc_stat_cpu()
+    if total_now is None or idle_now is None:
+        return 0.0
+
+    last_total = _last_cpu_sample["total"]
+    last_idle = _last_cpu_sample["idle"]
+    now = time.time()
+
+    if last_total == 0.0 or total_now <= last_total:
+        _last_cpu_sample = {"total": total_now, "idle": idle_now, "time": now}
+        time.sleep(0.06)
+        t2, i2 = read_proc_stat_cpu()
+        if t2 is not None and i2 is not None and t2 > total_now:
+            d_total = t2 - total_now
+            d_idle = i2 - idle_now
+            pct = round(max(0.0, min(100.0, (1.0 - (d_idle / d_total)) * 100.0)), 1)
+            _last_cpu_sample = {"total": t2, "idle": i2, "time": time.time()}
+            return pct
+        return 0.0
+
+    d_total = total_now - last_total
+    d_idle = idle_now - last_idle
+    _last_cpu_sample = {"total": total_now, "idle": idle_now, "time": now}
+    if d_total <= 0:
+        return 0.0
+    return round(max(0.0, min(100.0, (1.0 - (d_idle / d_total)) * 100.0)), 1)
+
+
+def get_system_stats():
+    """Retrieve host system information (CPU, RAM, Uptime)."""
+    stats = {
+        "cpu_percent": 0.0,
+        "ram_total_mb": 0,
+        "ram_used_mb": 0,
+        "ram_percent": 0.0,
+        "uptime_str": "unknown",
+        "load_avg": [0.0, 0.0, 0.0]
+    }
+
+    try:
+        stats["cpu_percent"] = get_cpu_percent()
+    except Exception:
+        pass
+
+    try:
+        # Load average
+        if hasattr(os, "getloadavg"):
+            stats["load_avg"] = [round(x, 2) for x in os.getloadavg()]
+    except Exception:
+        pass
+
+    try:
+        # Memory from /proc/meminfo
+        if os.path.isfile("/proc/meminfo"):
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        val = parts[1].strip().split()[0]
+                        mem[key] = int(val)
+            total_kb = mem.get("MemTotal", 0)
+            avail_kb = mem.get("MemAvailable", mem.get("MemFree", 0))
+            used_kb = total_kb - avail_kb
+            if total_kb > 0:
+                stats["ram_total_mb"] = round(total_kb / 1024, 1)
+                stats["ram_used_mb"] = round(used_kb / 1024, 1)
+                stats["ram_percent"] = round((used_kb / total_kb) * 100, 1)
+    except Exception:
+        pass
+
+    try:
+        # Uptime from /proc/uptime
+        if os.path.isfile("/proc/uptime"):
+            with open("/proc/uptime", "r") as f:
+                up_sec = float(f.read().split()[0])
+                days = int(up_sec // 86400)
+                hours = int((up_sec % 86400) // 3600)
+                minutes = int((up_sec % 3600) // 60)
+                parts = []
+                if days > 0:
+                    parts.append(f"{days}d")
+                if hours > 0 or days > 0:
+                    parts.append(f"{hours}h")
+                parts.append(f"{minutes}m")
+                stats["uptime_str"] = " ".join(parts)
+    except Exception:
+        pass
+
+    return stats
+
+
+def get_easytier_peers():
+    """Call easytier-cli peer -o json and return parsed structured list."""
+    cli_path = os.path.join(BIN_DIR, "easytier-cli")
+    if not os.path.isfile(cli_path):
+        cli_path = "easytier-cli"
+
+    cmd = [cli_path, "-p", "127.0.0.1:15888", "-o", "json", "peer"]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+
+    # Try fallback without -p
+    try:
+        cmd2 = [cli_path, "-o", "json", "peer"]
+        res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res2.returncode == 0 and res2.stdout.strip():
+            return json.loads(res2.stdout)
+    except Exception:
+        pass
+
+    return None
+
+
+def get_easytier_peer_remote_hosts():
+    """Map each directly connected peer's id to the remote hosts of its tunnels.
+
+    The peer table only says "udp" for a peer reached across a BackPack link, so the
+    verbose listing is needed to see which address the tunnel actually runs to.
+    """
+    cli_path = os.path.join(BIN_DIR, "easytier-cli")
+    if not os.path.isfile(cli_path):
+        cli_path = "easytier-cli"
+    try:
+        res = subprocess.run(
+            [cli_path, "-p", "127.0.0.1:15888", "-o", "json", "-v", "peer"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+        )
+        data = json.loads(res.stdout) if res.returncode == 0 and res.stdout.strip() else None
+    except Exception:
+        return {}
+
+    hosts = {}
+
+    def walk(node):
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+        elif isinstance(node, dict):
+            if isinstance(node.get("conns"), list):
+                peer_id = str(node.get("peer_id", ""))
+                for conn in node["conns"]:
+                    tunnel = conn.get("tunnel") if isinstance(conn, dict) else None
+                    remote = tunnel.get("remote_addr") if isinstance(tunnel, dict) else None
+                    url = remote.get("url") if isinstance(remote, dict) else remote
+                    try:
+                        host = urllib.parse.urlparse(str(url or "")).hostname
+                    except ValueError:
+                        host = None
+                    if peer_id and host:
+                        hosts.setdefault(peer_id, set()).add(host)
+            else:
+                for value in node.values():
+                    walk(value)
+
+    walk(data)
+    return hosts
+
+
+def get_easytier_routes():
+    """Call easytier-cli route and return table/JSON."""
+    cli_path = os.path.join(BIN_DIR, "easytier-cli")
+    if not os.path.isfile(cli_path):
+        cli_path = "easytier-cli"
+
+    # Try json if supported, else text
+    try:
+        cmd = [cli_path, "-p", "127.0.0.1:15888", "-o", "json", "route"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            return json.loads(res.stdout)
+    except Exception:
+        pass
+
+    try:
+        cmd = [cli_path, "-p", "127.0.0.1:15888", "route"]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if res.returncode == 0:
+            return {"raw": res.stdout}
+    except Exception:
+        pass
+
+    return {"raw": "Routing table unavailable or EasyTier offline."}
+
+
+def get_tunnels():
+    """Read HAProxy, iptables, GOST, and Realm configured tunnels."""
+    tunnels = {"haproxy": [], "iptables": [], "gost": [], "realm": []}
+
+    # HAProxy tunnels
+    if os.path.isdir(HAPROXY_DIR):
+        for fname in os.listdir(HAPROXY_DIR):
+            if fname.endswith(".env"):
+                data = load_env_file(os.path.join(HAPROXY_DIR, fname))
+                if data:
+                    tunnels["haproxy"].append(data)
+
+    # iptables tunnels
+    if os.path.isdir(IPTABLES_DIR):
+        for fname in os.listdir(IPTABLES_DIR):
+            if fname.endswith(".env"):
+                data = load_env_file(os.path.join(IPTABLES_DIR, fname))
+                if data:
+                    tunnels["iptables"].append(data)
+
+    # GOST tunnels
+    if os.path.isdir(GOST_TUNNEL_DIR):
+        for fname in os.listdir(GOST_TUNNEL_DIR):
+            if fname.endswith(".env"):
+                data = load_env_file(os.path.join(GOST_TUNNEL_DIR, fname))
+                if data:
+                    tunnels["gost"].append(data)
+
+    # Realm tunnels
+    if os.path.isdir(REALM_TUNNEL_DIR):
+        for fname in os.listdir(REALM_TUNNEL_DIR):
+            if fname.endswith(".env"):
+                data = load_env_file(os.path.join(REALM_TUNNEL_DIR, fname))
+                if data:
+                    tunnels["realm"].append(data)
+
+    # Check systemd status
+    def check_service(name):
+        try:
+            r = subprocess.run(["systemctl", "is-active", name], stdout=subprocess.PIPE, text=True)
+            return r.stdout.strip()
+        except Exception:
+            return "unknown"
+
+    tunnels["haproxy_service"] = check_service("sutun-haproxy.service")
+    tunnels["iptables_service"] = check_service("sutun-iptables.service")
+    tunnels["gost_service"] = check_service("sutun-gost.service")
+    tunnels["realm_service"] = check_service("sutun-realm.service")
+    tunnels["iperf_service"] = check_service("sutun-iperf.service")
+
+    return tunnels
+
+
+def ensure_sutun_script():
+    """Find the sutun.sh script path or automatically download it if missing."""
+    import shutil
+    candidates = [
+        os.path.join(INSTALL_DIR, "sutun.sh"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "sutun.sh"),
+        "/usr/local/bin/sutun",
+    ]
+    which_sutun = shutil.which("sutun")
+    if which_sutun and which_sutun not in candidates:
+        candidates.append(which_sutun)
+
+    for c in candidates:
+        if os.path.isfile(c) and os.access(c, os.R_OK):
+            return c
+
+    for loc in ["/root/sutun.sh", "/root/SuTun/sutun.sh"]:
+        if os.path.isfile(loc) and os.access(loc, os.R_OK):
+            return loc
+
+    target = os.path.join(INSTALL_DIR, "sutun.sh")
+    try:
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        branch = get_active_branch()
+        url = f"https://raw.githubusercontent.com/mdjes/SuTun/{branch}/sutun.sh?t={int(time.time())}"
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+                "User-Agent": f"SuTun-Web/{CURRENT_VERSION}"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                with open(target, "wb") as f:
+                    f.write(resp.read())
+                os.chmod(target, 0o755)
+                try:
+                    if not os.path.exists("/usr/local/bin/sutun"):
+                        os.symlink(target, "/usr/local/bin/sutun")
+                except Exception:
+                    pass
+                return target
+    except Exception as e:
+        sys.stderr.write(f"Failed to auto-download sutun.sh: {e}\n")
+
+    return target
+
+
+def ensure_cli_and_runner_fixed():
+    """Ensure sutun-runner and sutun.sh do not contain accidental TCP fallback in pure UDP mode."""
+    runner_path = os.path.join(INSTALL_DIR, "sutun-runner")
+    if os.path.isfile(runner_path):
+        try:
+            with open(runner_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            changed = False
+            old_udp_listener = 'args+=(--listeners "udp://0.0.0.0:${PORT}" --listeners "tcp://0.0.0.0:${PORT}")'
+            new_udp_listener = 'args+=(--listeners "udp://0.0.0.0:${PORT}")'
+            if old_udp_listener in content:
+                content = content.replace(old_udp_listener, new_udp_listener)
+                changed = True
+
+            if re.search(r'udp\)\s+peer_args\+=\("tcp://\$\{target\}"\s+"udp://\$\{target\}"\)', content):
+                content = re.sub(r'(udp\)\s+)peer_args\+=\("tcp://\$\{target\}"\s+"udp://\$\{target\}"\)', r'\1peer_args+=("udp://${target}")', content)
+                changed = True
+
+            if changed:
+                with open(runner_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                os.chmod(runner_path, 0o755)
+                print("[Cluster-Fix] Patched /opt/sutun/sutun-runner to ensure pure UDP execution.", flush=True)
+        except Exception as e:
+            print(f"[Cluster-Fix] Warning patching runner: {e}", flush=True)
+
+    for sh_path in [os.path.join(INSTALL_DIR, "sutun.sh"), "/usr/local/bin/sutun"]:
+        if os.path.isfile(sh_path):
+            try:
+                with open(sh_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                changed = False
+                old_udp_listener = 'args+=(--listeners "udp://0.0.0.0:${PORT}" --listeners "tcp://0.0.0.0:${PORT}")'
+                new_udp_listener = 'args+=(--listeners "udp://0.0.0.0:${PORT}")'
+                if old_udp_listener in content:
+                    content = content.replace(old_udp_listener, new_udp_listener)
+                    changed = True
+                if re.search(r'udp\)\s+peer_args\+=\("tcp://\$\{target\}"\s+"udp://\$\{target\}"\)', content):
+                    content = re.sub(r'(udp\)\s+)peer_args\+=\("tcp://\$\{target\}"\s+"udp://\$\{target\}"\)', r'\1peer_args+=("udp://${target}")', content)
+                    changed = True
+                if changed:
+                    with open(sh_path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    os.chmod(sh_path, 0o755)
+                    print(f"[Cluster-Fix] Patched {sh_path} to ensure pure UDP execution.", flush=True)
+            except Exception:
+                pass
+
+
+def get_sutun_script():
+    """Find the sutun.sh script path."""
+    return ensure_sutun_script()
+
+
+def get_network_interfaces():
+    """Retrieve available host network interfaces using multiple discovery methods."""
+    found = set()
+
+    # 1. Method A: ip -o link show
+    try:
+        r = subprocess.run(["ip", "-o", "link", "show"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=2)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split(":", 2)
+                if len(parts) >= 2:
+                    iface = parts[1].strip().split("@")[0]
+                    if iface and iface not in ("lo", "any") and not iface.startswith(("easytier", "docker", "veth", "br-")):
+                        found.add(iface)
+    except Exception:
+        pass
+
+    # 2. Method B: /sys/class/net directory listing
+    try:
+        if os.path.isdir("/sys/class/net"):
+            for iface in os.listdir("/sys/class/net"):
+                if iface not in ("lo", "any") and not iface.startswith(("easytier", "docker", "veth", "br-")):
+                    found.add(iface)
+    except Exception:
+        pass
+
+    # 3. Method C: /proc/net/dev inspection
+    try:
+        if os.path.isfile("/proc/net/dev"):
+            with open("/proc/net/dev", "r") as f:
+                for line in f:
+                    if ":" in line:
+                        iface = line.split(":")[0].strip()
+                        if iface and iface not in ("lo", "any") and not iface.startswith(("easytier", "docker", "veth", "br-")):
+                            found.add(iface)
+    except Exception:
+        pass
+
+    return normalize_network_interfaces(sorted(found)) or ["any"]
+
+
+def run_sutun_cmd(args, timeout=45):
+    """Execute an sutun.sh command with arguments and return (success, message)."""
+    ensure_cli_and_runner_fixed()
+    script = get_sutun_script()
+    if not os.path.isfile(script):
+        return False, (
+            f"SuTun CLI script not found at {script}. "
+            f"Please run: bash <(curl -fsSL https://raw.githubusercontent.com/mdjes/SuTun/{get_active_branch()}/sutun.sh)"
+        )
+    cmd = ["bash", script] + args
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+        output = (r.stdout + "\n" + r.stderr).strip()
+        clean_out = re.sub(r'\x1b\[[0-9;]*[mGKF]', '', output).strip()
+        return r.returncode == 0, clean_out
+    except subprocess.TimeoutExpired:
+        return False, f"Command timed out after {timeout}s."
+    except Exception as e:
+        return False, str(e)
+
+
+UPDATER_UNIT = "sutun-updater-temp"
+
+
+def spawn_detached_node_update():
+    """Start `sutun.sh node-update` outside the web service's cgroup and record it as queued.
+
+    The web service is restarted during the update, so the updater must not be its child.
+    Returns (ok, message, code) with code queued, already_running or launch_failed.
+    """
+    if update_job_running():
+        return False, "An update is already running on this server.", "already_running"
+
+    ensure_cli_and_runner_fixed()
+    script = get_sutun_script()
+    if not os.path.isfile(script):
+        return False, f"SuTun CLI script not found at {script}", "launch_failed"
+
+    branch = get_active_branch()
+    now = int(time.time())
+    job = {
+        "state": "queued",
+        "step": "queued",
+        "branch": branch,
+        "from_version": CURRENT_VERSION,
+        "target_version": (get_cached_version_info() or {}).get("latest_version", ""),
+        "error": "",
+        "rolled_back": False,
+        "started_at": now,
+        "updated_at": now,
+    }
+    try:
+        write_update_status(job)
+    except Exception:
+        pass
+
+    # 1. A transient systemd unit survives the web service restart. The branch is passed
+    #    explicitly because systemd-run does not inherit this process's environment.
+    if shutil.which("systemd-run"):
+        for cmd in (["systemctl", "stop", f"{UPDATER_UNIT}.service"], ["systemctl", "reset-failed", f"{UPDATER_UNIT}.service"]):
+            try:
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+            except Exception:
+                pass
+        base = [
+            "systemd-run",
+            f"--unit={UPDATER_UNIT}",
+            "--description=SuTun Background Node Updater",
+            "--remain-after-exit=no",
+            f"--setenv=SUTUN_BRANCH={branch}",
+        ]
+        # --collect (systemd 236+) cleans up failed runs; retry without it on older hosts.
+        for extra in (["--collect"], []):
+            try:
+                r = subprocess.run(base + extra + ["bash", script, "node-update"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+                if r.returncode == 0:
+                    return True, "Update started in a detached systemd unit.", "queued"
+            except Exception:
+                pass
+
+    # 2. Fallback: a new session outside this request, logging to a file.
+    try:
+        log_file = "/var/log/sutun-update.log"
+        with open(log_file, "ab") as log:
+            subprocess.Popen(
+                ["bash", script, "node-update"],
+                stdout=log,
+                stderr=log,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+                env=dict(os.environ, SUTUN_BRANCH=branch),
+            )
+        return True, f"Update started in the background (log: {log_file}).", "queued"
+    except Exception as e:
+        job.update({"state": "failed", "step": "queued", "error": f"Could not start the updater: {e}", "finished_at": int(time.time())})
+        try:
+            write_update_status(job)
+        except Exception:
+            pass
+        return False, f"Could not start the updater: {e}", "launch_failed"
+
+
+_public_ip_cache = {"ip": "", "time": 0.0}
+
+def is_public_ipv4(ip_str):
+    """Check if an IPv4 address is publicly routable (not private/loopback/carrier-grade)."""
+    if not ip_str or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip_str):
+        return False
+    parts = [int(p) for p in ip_str.split(".")]
+    if any(p < 0 or p > 255 for p in parts):
+        return False
+    if parts[0] in (0, 10, 127):
+        return False
+    if parts[0] == 172 and 16 <= parts[1] <= 31:
+        return False
+    if parts[0] == 192 and parts[1] == 168:
+        return False
+    if parts[0] == 169 and parts[1] == 254:
+        return False
+    if parts[0] == 100 and 64 <= parts[1] <= 127:  # Carrier-grade NAT
+        return False
+    return True
+
+def get_server_public_ip():
+    """Detect public IPv4 of the server prioritizing local physical interfaces before outbound NAT (cached 60s)."""
+    now = time.time()
+    if _public_ip_cache["ip"] and (now - _public_ip_cache["time"]) < 60:
+        return _public_ip_cache["ip"]
+
+    # 1. Check web.env or config.env for explicit public IP
+    web_cfg = load_env_file(WEB_ENV_FILE)
+    node_cfg = load_env_file(CONFIG_FILE)
+    configured = web_cfg.get("WEB_PUBLIC_IP") or node_cfg.get("PUBLIC_IP")
+    if configured and is_public_ipv4(configured):
+        _public_ip_cache["ip"] = configured
+        _public_ip_cache["time"] = now
+        return configured
+
+    # 2. Check physical network interfaces for a directly bound public IPv4
+    try:
+        r = subprocess.run(["ip", "-o", "-4", "addr", "show", "scope", "global"], stdout=subprocess.PIPE, text=True, timeout=2)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                dev = parts[1]
+                if any(dev.startswith(pfx) for pfx in ("easytier", "tun", "tap", "docker", "br-", "veth", "wg", "lo")):
+                    continue
+                ip = parts[3].split("/")[0]
+                if is_public_ipv4(ip):
+                    _public_ip_cache["ip"] = ip
+                    _public_ip_cache["time"] = now
+                    return ip
+    except Exception:
+        pass
+
+    # 3. Route lookup (if default route source is public)
+    try:
+        r = subprocess.run(["ip", "route", "get", "1.1.1.1"], stdout=subprocess.PIPE, text=True, timeout=2)
+        m = re.search(r"src\s+([0-9.]+)", r.stdout)
+        if m and is_public_ipv4(m.group(1)):
+            ip = m.group(1)
+            _public_ip_cache["ip"] = ip
+            _public_ip_cache["time"] = now
+            return ip
+    except Exception:
+        pass
+
+    # 4. Multi-provider external query (fallback for 1:1 NAT cloud servers)
+    providers = [
+        "https://api.ipify.org",
+        "https://icanhazip.com",
+        "https://ifconfig.me/ip",
+        "https://checkip.amazonaws.com"
+    ]
+    for url in providers:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.88.1"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if is_public_ipv4(ip):
+                    _public_ip_cache["ip"] = ip
+                    _public_ip_cache["time"] = now
+                    return ip
+        except Exception:
+            continue
+
+    # Fallback to curl CLI
+    for url in ("https://api.ipify.org", "https://icanhazip.com"):
+        try:
+            r = subprocess.run(["curl", "-4", "-s", "--connect-timeout", "2", url], stdout=subprocess.PIPE, text=True, timeout=3)
+            ip = r.stdout.strip()
+            if is_public_ipv4(ip):
+                _public_ip_cache["ip"] = ip
+                _public_ip_cache["time"] = now
+                return ip
+        except Exception:
+            pass
+
+    # Route lookup fallback (only accept if truly public)
+    try:
+        r = subprocess.run(["ip", "route", "get", "1.1.1.1"], stdout=subprocess.PIPE, text=True, timeout=2)
+        m = re.search(r"src\s+([0-9.]+)", r.stdout)
+        if m and is_public_ipv4(m.group(1)):
+            ip = m.group(1)
+            _public_ip_cache["ip"] = ip
+            _public_ip_cache["time"] = now
+            return ip
+    except Exception:
+        pass
+
+    return ""
+
+
+_public_ipv6_cache = {"ip": "", "time": 0.0}
+_VIRTUAL_IFACE_PREFIXES = ("easytier", "tun", "tap", "docker", "br-", "veth", "wg", "lo", "xrmi")
+
+
+def is_public_ipv6(ip_str):
+    """True for a globally routable IPv6 address (not ULA, link-local, loopback or documentation)."""
+    try:
+        ip = ipaddress.IPv6Address(str(ip_str or "").strip())
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+def get_server_public_ipv6():
+    """Detect this server's public IPv6, preferring a stable address bound to a physical interface (cached 60s)."""
+    now = time.time()
+    if (now - _public_ipv6_cache["time"]) < 60:
+        return _public_ipv6_cache["ip"]
+
+    found = ""
+    try:
+        r = subprocess.run(["ip", "-o", "-6", "addr", "show", "scope", "global"], stdout=subprocess.PIPE, text=True, timeout=2)
+        candidates = []
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 4 or any(parts[1].startswith(p) for p in _VIRTUAL_IFACE_PREFIXES):
+                continue
+            ip = parts[3].split("/")[0]
+            if not is_public_ipv6(ip) or "deprecated" in parts:
+                continue
+            # Privacy (temporary) addresses rotate, so other servers should not be told to dial them.
+            candidates.append((1 if "temporary" in parts else 0, ip))
+        if candidates:
+            found = sorted(candidates)[0][1]
+    except Exception:
+        pass
+
+    if not found:
+        try:
+            r = subprocess.run(["curl", "-6", "-s", "--connect-timeout", "2", "--max-time", "3", "https://api6.ipify.org"],
+                               stdout=subprocess.PIPE, text=True, timeout=4)
+            if is_public_ipv6(r.stdout.strip()):
+                found = r.stdout.strip()
+        except Exception:
+            pass
+
+    _public_ipv6_cache["ip"] = found
+    _public_ipv6_cache["time"] = now
+    return found
+
+
+def valid_tunnel_name(name):
+    """Return True for tunnel names safe for env filenames and CLI usage."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", name or ""))
+
+
+def sanitize_peer_endpoint(raw_peer, default_port="11010"):
+    """
+    Sanitize and validate a peer endpoint string.
+    Returns cleaned 'scheme://host:port' or 'host:port', or '' if invalid.
+    Fixes double colons, trailing colons, and missing hosts.
+    """
+    if not raw_peer:
+        return ""
+    p = str(raw_peer).strip().rstrip("/")
+    if not p:
+        return ""
+    scheme = ""
+    if "://" in p:
+        scheme, p = p.split("://", 1)
+        scheme = scheme.lower().strip()
+
+    p = p.rstrip(":")
+    if not p or p.startswith(":") or p.isdigit():
+        return ""
+
+    if "[" in p and "]" in p:
+        m = re.match(r"^(\[[^\]]+\])(?::+(\d+))?$", p)
+        if not m:
+            return ""
+        host = m.group(1)
+        port = m.group(2) or str(default_port)
+    else:
+        m = re.match(r"^(.+?):+(\d+)$", p)
+        if m:
+            host = m.group(1).rstrip(":")
+            port = m.group(2)
+        else:
+            host = p.rstrip(":")
+            port = str(default_port)
+
+    if not host or host.startswith(":") or host == ":" or host.isdigit():
+        return ""
+    if not str(port).isdigit():
+        port = str(default_port)
+
+    hostport = f"{host}:{port}"
+    if scheme:
+        if scheme in ("ws", "wss"):
+            return f"{scheme}://{hostport}/"
+        return f"{scheme}://{hostport}"
+    return hostport
+
+
+MESH_PROTOCOLS = ("dual", "udp", "tcp", "ws", "wss", "quic", "faketcp", "icmp", "pck")
+# Protocols whose peers connect over per-server BackPack links, and the carrier each one uses.
+BACKPACK_CARRIERS = {"icmp": "xdi", "pck": "pck"}
+# EasyTier MTU across a BackPack (ICMP or PCK) link; mirrors ICMP_MESH_MTU in sutun.sh.
+ICMP_MESH_MTU = 1280
+ICMP_LINK_MAX_INDEX = 16383
+ICMP_LINK_DIR = "/etc/sutun/icmp-links"
+
+# Zero-width and bidi control characters that chat apps and RTL pages slip into copied text.
+_INVISIBLE_CHARS_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+_INVITE_RUN_RE = re.compile(r"[A-Za-z0-9+/_=\s-]+")
+
+
+class InviteTokenError(ValueError):
+    """Raised when a pasted mesh invite code cannot be used. `code` is a stable id for the UI."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _decode_invite_candidate(token):
+    token = token.replace("-", "+").replace("_", "/").rstrip("=")
+    if not token:
+        return None
+    token += "=" * (-len(token) % 4)
+    try:
+        text = base64.b64decode(token, validate=True).decode("utf-8")
+        data, _ = json.JSONDecoder().raw_decode(text.lstrip())
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def decode_invite_token(raw):
+    """
+    Decode an xrmesh:// invite code into a normalized dict.
+    Tolerates surrounding text, line wrapping, invisible bidi marks, URL-safe base64
+    and missing padding, because codes are usually copied from terminals or chat apps.
+    """
+    text = _INVISIBLE_CHARS_RE.sub("", str(raw or ""))
+    prefix = re.search(r"xrmesh://", text, re.IGNORECASE)
+    if prefix:
+        text = text[prefix.end():]
+    text = re.sub(r"^[^A-Za-z0-9+/_-]+", "", text)
+    run = _INVITE_RUN_RE.match(text)
+    run = run.group(0) if run else ""
+
+    # A wrapped code spans several lines; a code followed by other words must stop at the first gap.
+    data = None
+    for candidate in (re.sub(r"\s+", "", run), run.split()[0] if run.split() else ""):
+        data = _decode_invite_candidate(candidate)
+        if data is not None:
+            break
+    if data is None:
+        raise InviteTokenError(
+            "invalid_invite",
+            "This is not a valid SuTun invite code. Copy the complete code that starts with xrmesh:// and try again.",
+        )
+
+    net = str(data.get("net") or data.get("network_name") or "").strip()
+    secret = str(data.get("secret") or data.get("network_secret") or "").strip()
+    if not net or not secret:
+        raise InviteTokenError("invite_incomplete", "The invite code is missing the network name or secret.")
+
+    proto = str(data.get("proto") or data.get("protocol") or "dual").strip().lower()
+    invite = {
+        "net": net,
+        "secret": secret,
+        "endpoint": str(data.get("endpoint") or data.get("peer") or "").strip(),
+        "proto": proto if proto in MESH_PROTOCOLS else "dual",
+    }
+    # Optional transport settings (added in 2.2.6-beta.4) so a joining node matches the mesh.
+    for key in ("enc", "kcp", "ipv6"):
+        if isinstance(data.get(key), bool):
+            invite[key] = data[key]
+    mtu = data.get("mtu")
+    if isinstance(mtu, int) and not isinstance(mtu, bool) and 576 <= mtu <= 9000:
+        invite["mtu"] = mtu
+    # The inviting server's mesh port (added in 3.0.0-beta.8); older codes only have it in the endpoint.
+    port = data.get("port")
+    if isinstance(port, int) and not isinstance(port, bool) and parse_port(port):
+        invite["port"] = port
+    elif split_endpoint(invite["endpoint"]):
+        invite["port"] = split_endpoint(invite["endpoint"])[1]
+    if invite["proto"] in BACKPACK_CARRIERS:
+        # ICMP codes carry their link as "icmp" (older joiners read it there); other carriers as "link".
+        link = data.get("link") if isinstance(data.get("link"), dict) else data.get("icmp")
+        invite["icmp"] = parse_icmp_link(link, invite["endpoint"], invite["proto"])
+    return invite
+
+
+def invite_link_key(proto):
+    """The invite field that carries a BackPack link for a protocol."""
+    return "icmp" if proto == "icmp" else "link"
+
+
+def split_endpoint(endpoint):
+    """Split 'host:port' or '[v6]:port' into (host, port), or return None."""
+    m = re.fullmatch(r"\[?([^\[\]]+?)\]?:(\d{1,5})", str(endpoint or "").strip())
+    if not m or parse_port(m.group(2)) is None:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+def parse_icmp_link(link, endpoint, proto="icmp"):
+    """Validate the BackPack link an invite carries: which server to reach, and the link's token and slot."""
+    name = proto.upper()
+    if not isinstance(link, dict) or not split_endpoint(endpoint):
+        raise InviteTokenError(
+            "invite_icmp_missing",
+            f"This {name} invite has no link details. Generate a new invite on the other server.",
+        )
+    token, port, idx = link.get("t"), link.get("p"), link.get("i")
+    host = split_endpoint(endpoint)[0]
+    valid = (
+        isinstance(token, str) and re.fullmatch(r"[A-Za-z0-9]{16,128}", token)
+        and isinstance(port, int) and not isinstance(port, bool) and parse_port(port) is not None
+        and isinstance(idx, int) and not isinstance(idx, bool) and 0 <= idx <= ICMP_LINK_MAX_INDEX
+        and re.fullmatch(r"[A-Za-z0-9.-]{1,253}|[0-9A-Fa-f:]{2,39}", host)
+    )
+    if not valid:
+        raise InviteTokenError("invite_icmp_missing", f"The {name} link details in this invite are invalid.")
+    return {"t": token, "p": port, "i": idx}
+
+
+def cli_version_mismatch_error():
+    """Explain when the installed sutun.sh is a different release than this panel, else return None.
+
+    ICMP/PCK links are created by commands that only newer scripts have; an older script answers
+    with its usage text, which tells the user nothing.
+    """
+    try:
+        with open(get_sutun_script(), encoding="utf-8", errors="ignore") as f:
+            m = re.search(r'^readonly VERSION="([^"]+)"', f.read(), re.MULTILINE)
+    except OSError:
+        return None
+    if not m or m.group(1) == CURRENT_VERSION:
+        return None
+    return (
+        f"This server's SuTun CLI is {m.group(1)} but the web panel is {CURRENT_VERSION}. "
+        "Run 'sudo sutun node-update' on this server, then try again."
+    )
+
+
+def last_json_line(output):
+    """Return the last JSON object printed by an sutun.sh command, ignoring its progress messages."""
+    for line in reversed(str(output or "").splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                return json.loads(line)
+            except ValueError:
+                return None
+    return None
+
+
+def backpack_links():
+    """This server's BackPack links, read from the link files sutun.sh writes."""
+    try:
+        names = sorted(os.listdir(ICMP_LINK_DIR))
+    except OSError:
+        return []
+    links = []
+    for fname in names:
+        if not fname.endswith(".env"):
+            continue
+        env = load_env_file(os.path.join(ICMP_LINK_DIR, fname))
+        if not env.get("PEER_IP"):
+            continue
+        links.append({
+            "role": env.get("ROLE", ""),
+            # Links written before PCK existed have no CARRIER and are ICMP links.
+            "transport": "pck" if env.get("CARRIER") == "pck" else "icmp",
+            "peer_ip": env["PEER_IP"],
+            "peer_host": env.get("PEER_HOST", ""),
+        })
+    return links
+
+
+def joined_via_link(links, peers):
+    """Public address of the server this one joined over a BackPack link, or '' if it did not."""
+    for link in links:
+        if link["role"] == "dial" and f"//{link['peer_ip']}:" in (peers or ""):
+            return link["peer_host"]
+    return ""
+
+
+def valid_mesh_hostname(name):
+    """Return True for node names EasyTier and the peer listings can display safely."""
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", name or ""))
+
+
+def valid_ipv4(ip_str):
+    """Return True for a dotted-quad IPv4 address written with ASCII digits."""
+    if not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip_str or "", re.ASCII):
+        return False
+    return all(int(p) <= 255 for p in ip_str.split("."))
+
+
+def parse_port(value):
+    """Return the port as an int when it is within 1-65535, otherwise None."""
+    try:
+        port = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return port if 1 <= port <= 65535 else None
+
+
+def parse_mtu(value):
+    """Return the MTU as an int when it is within 576-9000, otherwise None."""
+    try:
+        mtu = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return mtu if 576 <= mtu <= 9000 else None
+
+
+def has_control_chars(value):
+    """True when a value would break the one-line-per-key config file or EasyTier's arguments."""
+    return any(ord(c) < 32 or ord(c) == 127 for c in str(value))
+
+
+def write_config_bytes(raw):
+    """Atomically restore CONFIG_FILE from raw bytes with secure permissions."""
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, CONFIG_FILE)
+
+
+def save_node_config_env(cfg):
+    """Write dictionary to CONFIG_FILE with secure file permissions."""
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    if "PEERS" in cfg:
+        mesh_port = str(cfg.get("PORT", "11010"))
+        clean_p = []
+        for p in str(cfg["PEERS"]).split(","):
+            sp = sanitize_peer_endpoint(p, mesh_port)
+            if sp and sp not in clean_p:
+                clean_p.append(sp)
+        cfg["PEERS"] = ",".join(clean_p)
+
+    lines = []
+    keys = [
+        "NETWORK_NAME", "NETWORK_SECRET", "HOSTNAME", "IPV4",
+        "PROTOCOL", "PORT", "PEERS", "ENCRYPTION", "IPV6",
+        "MTU", "ENABLE_KCP", "MULTI_THREAD"
+    ]
+    for k in keys:
+        v = str(cfg.get(k, ""))
+        escaped_v = v.replace("'", "'\\''")
+        lines.append(f"{k}='{escaped_v}'\n")
+
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    try:
+        os.chmod(tmp, 0o600)
+    except Exception:
+        pass
+    os.replace(tmp, CONFIG_FILE)
+
+
+# ==============================================================================
+# 🌐 SafeSync: Mesh-Wide Cluster Synchronization & Rollback Watchdog
+# ==============================================================================
+
+CLUSTER_NONCE_CACHE = {}  # nonce -> timestamp
+ROLLBACK_TIMER = None
+ROLLBACK_LOCK = threading.Lock()
+ROLLBACK_EXPIRY = 0.0
+LAST_ROLLBACK = {
+    "occurred": False,
+    "timestamp": 0,
+    "reason": "",
+    "failed_protocol": "",
+    "restored_protocol": ""
+}
+
+ALLOWED_CLUSTER_KEYS = (
+    "PROTOCOL",
+    "ENABLE_KCP",
+    "ENCRYPTION",
+    "IPV6",
+    "MTU",
+    "NETWORK_SECRET",
+    "NETWORK_NAME",
+)
+
+
+ICMP_SAFESYNC_ERROR = (
+    "ICMP and PCK links are created per server through invite codes, so SafeSync cannot switch "
+    "the whole mesh to or from ICMP or PCK. Change the protocol on this server and invite the others instead."
+)
+
+
+def icmp_protocol_switch(current, new):
+    """True when a synced protocol change would move a node onto, off or between BackPack links (ICMP/PCK)."""
+    current = str(current or "dual").strip().lower()
+    new = str(new or "").strip().lower()
+    return bool(new) and new != current and (current in BACKPACK_CARRIERS or new in BACKPACK_CARRIERS)
+
+
+def cleanup_nonce_cache():
+    now = time.time()
+    for n in list(CLUSTER_NONCE_CACHE.keys()):
+        if now - CLUSTER_NONCE_CACHE[n] > 120.0:
+            del CLUSTER_NONCE_CACHE[n]
+
+
+def verify_cluster_hmac(headers, raw_body):
+    """Verify HMAC-SHA256 signature on inter-node cluster commands with clock-skew tolerance and secret fallback."""
+    cleanup_nonce_cache()
+    sig = headers.get("X-Cluster-Signature", "").strip()
+    ts_str = headers.get("X-Cluster-Timestamp", "").strip()
+    nonce = headers.get("X-Cluster-Nonce", "").strip()
+    direct_secret = headers.get("X-Cluster-Secret", "").strip()
+
+    cfg = load_env_file(CONFIG_FILE)
+    secret = cfg.get("NETWORK_SECRET", "").strip()
+    secrets_to_try = [secret]
+    if os.path.isfile(CONFIG_BACKUP_FILE):
+        bak_cfg = load_env_file(CONFIG_BACKUP_FILE)
+        bak_secret = bak_cfg.get("NETWORK_SECRET", "").strip()
+        if bak_secret and bak_secret not in secrets_to_try:
+            secrets_to_try.append(bak_secret)
+
+    # 1. If direct secret matches, authenticate immediately (safeguard against clock skew or proxy header loss)
+    if direct_secret and any(s and secrets.compare_digest(direct_secret, s) for s in secrets_to_try):
+        if nonce:
+            CLUSTER_NONCE_CACHE[nonce] = time.time()
+        return True, ""
+
+    if not sig or not ts_str or not nonce:
+        return False, "Missing cluster authentication headers"
+
+    try:
+        ts = float(ts_str)
+    except Exception:
+        return False, "Invalid timestamp"
+
+    now = time.time()
+    if abs(now - ts) > 300.0:
+        return False, f"Request expired or clock skew (drift: {round(abs(now - ts), 1)}s)"
+
+    if nonce in CLUSTER_NONCE_CACHE:
+        return False, "Replay attack detected (nonce already processed)"
+
+    body_hash = hashlib.sha256(raw_body if raw_body else b"{}").hexdigest()
+    msg = f"{ts_str}\n{nonce}\n{body_hash}".encode("utf-8")
+
+    verified = False
+    for s in secrets_to_try:
+        if not s:
+            continue
+        expected = hmac.new(s.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+        if secrets.compare_digest(sig.lower(), expected.lower()):
+            verified = True
+            break
+
+    if not verified:
+        return False, "Invalid HMAC signature"
+
+    CLUSTER_NONCE_CACHE[nonce] = now
+    return True, ""
+
+
+def sign_cluster_request(secret, payload_dict):
+    """Sign inter-node cluster request using HMAC-SHA256 and include direct secret fallback."""
+    body_bytes = json.dumps(payload_dict, ensure_ascii=False).encode("utf-8")
+    ts_str = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    msg = f"{ts_str}\n{nonce}\n{body_hash}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    headers = {
+        "Content-Type": "application/json; charset=utf-8",
+        "X-Cluster-Signature": sig,
+        "X-Cluster-Timestamp": ts_str,
+        "X-Cluster-Nonce": nonce,
+        "X-Cluster-Secret": secret,
+        "User-Agent": f"SuTun-Cluster/{CURRENT_VERSION}"
+    }
+    return body_bytes, headers
+
+
+def rollback_cluster_config(reason=None):
+    """Revert configuration from backup and restart node service."""
+    global LAST_ROLLBACK
+    if os.path.isfile(CONFIG_BACKUP_FILE):
+        try:
+            failed_cfg = load_env_file(CONFIG_FILE)
+            failed_proto = failed_cfg.get("PROTOCOL", "unknown")
+            backup_cfg = load_env_file(CONFIG_BACKUP_FILE)
+            restored_proto = backup_cfg.get("PROTOCOL", "dual")
+
+            shutil.copy2(CONFIG_BACKUP_FILE, CONFIG_FILE)
+            try:
+                os.remove(CONFIG_STAGED_FILE)
+            except Exception:
+                pass
+
+            LAST_ROLLBACK = {
+                "occurred": True,
+                "timestamp": int(time.time()),
+                "reason": reason or f"Automatic self-healing rollback: No active peers connected with protocol '{failed_proto}' within 90s (UDP packet drop/filtering). Restored safe '{restored_proto}' configuration.",
+                "failed_protocol": failed_proto,
+                "restored_protocol": restored_proto
+            }
+            print(f"[Cluster-Rollback] {LAST_ROLLBACK['reason']}", flush=True)
+            print("[Cluster-Rollback] Restored config from backup! Restarting node...", flush=True)
+            ensure_cli_and_runner_fixed()
+            run_sutun_cmd(["node-restart"])
+            return True
+        except Exception as e:
+            print(f"[Cluster-Rollback] Error rolling back: {e}", flush=True)
+    return False
+
+
+def arm_rollback_watchdog(timeout_sec=90):
+    """Arm a self-healing rollback watchdog. If no peers connect within timeout, auto-rollback."""
+    global ROLLBACK_TIMER, ROLLBACK_EXPIRY
+    with ROLLBACK_LOCK:
+        if ROLLBACK_TIMER:
+            ROLLBACK_TIMER.cancel()
+        ROLLBACK_EXPIRY = time.time() + timeout_sec
+
+        def watchdog_action():
+            print("[Cluster-Watchdog] Timer expired! Verifying peer connectivity...", flush=True)
+            peers = get_easytier_peers()
+            connected = False
+            if peers:
+                for p in peers:
+                    cost = str(p.get("cost", "0"))
+                    if cost not in ("0", "Local", "none", ""):
+                        connected = True
+                        break
+            if not connected:
+                print("[Cluster-Watchdog] ⚠️ No active peers detected after configuration sync. Initiating self-healing rollback!", flush=True)
+                rollback_cluster_config()
+            else:
+                print("[Cluster-Watchdog] ✓ Active peer detected. Configuration verified safe.", flush=True)
+
+        ROLLBACK_TIMER = threading.Timer(timeout_sec, watchdog_action)
+        ROLLBACK_TIMER.daemon = True
+        ROLLBACK_TIMER.start()
+
+
+def disarm_rollback_watchdog():
+    """Disarm the rollback watchdog once configuration safety is verified."""
+    global ROLLBACK_TIMER, ROLLBACK_EXPIRY
+    with ROLLBACK_LOCK:
+        if ROLLBACK_TIMER:
+            ROLLBACK_TIMER.cancel()
+            ROLLBACK_TIMER = None
+        ROLLBACK_EXPIRY = 0.0
+
+
+def apply_staged_cluster_config():
+    """Apply staged configuration, create backup, arm watchdog, and restart service."""
+    if not os.path.isfile(CONFIG_STAGED_FILE):
+        return False, "No staged configuration found"
+
+    staged = load_env_file(CONFIG_STAGED_FILE)
+    if not staged:
+        return False, "Staged configuration file is empty"
+
+    current = load_env_file(CONFIG_FILE)
+    # 1. Create backup
+    try:
+        shutil.copy2(CONFIG_FILE, CONFIG_BACKUP_FILE)
+    except Exception as e:
+        return False, f"Failed to backup current config: {e}"
+
+    # 2. Merge only cluster-wide keys, preserving node identity (Hostname, IPV4, Port)
+    for k in ALLOWED_CLUSTER_KEYS:
+        if k in staged and staged[k] != "":
+            current[k] = staged[k]
+
+    # 3. Save new config
+    save_node_config_env(current)
+
+    # 4. Remove staged file
+    try:
+        os.remove(CONFIG_STAGED_FILE)
+    except Exception:
+        pass
+
+    # 5. Arm rollback watchdog (90 seconds)
+    arm_rollback_watchdog(timeout_sec=90)
+
+    # 6. Restart node service in background thread so HTTP response returns immediately
+    def restart_bg():
+        time.sleep(0.4)
+        ensure_cli_and_runner_fixed()
+        run_sutun_cmd(["node-restart"])
+
+    threading.Thread(target=restart_bg, daemon=True).start()
+    return True, "Config committed. Service restarting with 90s rollback watchdog."
+
+
+def send_cluster_http(target_ip, target_port, endpoint, secret, payload, timeout=6, strict_port=False):
+    """Send signed HTTP/HTTPS POST request to a cluster peer over mesh network,
+    probing candidate ports if connection to target_port fails."""
+    ok, data, _ = cluster_request(target_ip, target_port, endpoint, secret, payload, timeout, strict_port)
+    if not ok and isinstance(data, dict):
+        data = data.get("error") or str(data)
+    return ok, data
+
+
+def is_timeout_error(error):
+    return isinstance(error, (socket.timeout, TimeoutError)) or isinstance(
+        getattr(error, "reason", None), (socket.timeout, TimeoutError)
+    )
+
+
+def cluster_request(target_ip, target_port, endpoint, secret, payload, timeout=6, strict_port=False, stop_on_timeout=False):
+    """Like send_cluster_http, but also returns the HTTP status of the last reply
+    (None when the peer could not be reached at all).
+
+    stop_on_timeout is for commands that change state: a timeout may mean the peer is still
+    running the command, so it must not be sent again on another scheme or port."""
+    body_bytes, headers = sign_cluster_request(secret, payload)
+
+    insecure_ssl_ctx = ssl.create_default_context()
+    insecure_ssl_ctx.check_hostname = False
+    insecure_ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    if strict_port and target_port:
+        try:
+            ports_to_try = [int(target_port)]
+        except (TypeError, ValueError):
+            ports_to_try = get_peer_port_candidates(target_ip, target_port)
+    else:
+        ports_to_try = get_peer_port_candidates(target_ip, target_port)
+
+    schemes = ("https", "http") if is_ssl_enabled() else ("http", "https")
+    last_err = "Failed to connect to cluster peer"
+    last_status = None
+
+    for port in ports_to_try:
+        for scheme in schemes:
+            url = f"{scheme}://{target_ip}:{port}{endpoint}"
+            req = urllib.request.Request(url, data=body_bytes, headers=headers, method="POST")
+            try:
+                ctx = insecure_ssl_ctx if scheme == "https" else None
+                with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    if target_ip in PEER_VERSION_CACHE:
+                        PEER_VERSION_CACHE[target_ip]["port"] = port
+                    return True, data, resp.status
+            except urllib.error.HTTPError as e:
+                last_status = e.code
+                try:
+                    err_data = json.loads(e.read().decode("utf-8"))
+                    last_err = err_data.get("error", str(e)) if isinstance(err_data, dict) else str(e)
+                    if isinstance(err_data, dict) and err_data.get("code"):
+                        return False, err_data, e.code
+                except Exception:
+                    last_err = str(e)
+                # 403 and 404 mean we reached an SuTun panel: wrong secret, or too old for this endpoint.
+                if e.code in (403, 404):
+                    return False, last_err, e.code
+                continue
+            except Exception as e:
+                if stop_on_timeout and is_timeout_error(e):
+                    return False, "Request timed out", None
+                last_err = str(e)
+                continue
+    return False, last_err, last_status
+
+
+def cluster_error_code(http_status):
+    """Map a failed cluster_request to a stable code the UI can explain."""
+    if http_status == 403:
+        return "auth_failed"
+    if http_status == 404:
+        return "unsupported"
+    if http_status is None:
+        return "unreachable"
+    return "remote_error"
+
+
+def get_remote_network_interfaces(peer_ip, secret, timeout=2.0):
+    """Resolve interfaces from the selected peer without degrading failures to any."""
+    cached_interfaces = normalize_network_interfaces(
+        PEER_VERSION_CACHE.get(peer_ip, {}).get("interfaces")
+    )
+    cached_peer = PEER_VERSION_CACHE.get(peer_ip, {})
+    cache_is_fresh = (
+        cached_interfaces
+        and time.time() - cached_peer.get("timestamp", 0) < 60.0
+    )
+    if cache_is_fresh:
+        return cached_interfaces, "Used cached interface metadata from the peer probe."
+
+    peer_info, responsive_port, info_error = fetch_peer_cluster_info(
+        peer_ip,
+        cached_peer.get("port") or PORT,
+        timeout,
+        strict_port=True,
+    )
+    info_interfaces = normalize_network_interfaces(peer_info.get("interfaces") if peer_info else None)
+    if info_interfaces:
+        cached_peer = PEER_VERSION_CACHE.setdefault(peer_ip, {})
+        cached_peer["interfaces"] = info_interfaces
+        if responsive_port:
+            cached_peer["port"] = responsive_port
+        cached_peer["timestamp"] = time.time()
+        return info_interfaces, "Used public cluster metadata for interface discovery."
+
+
+    signed_target_port = responsive_port or PORT
+    signed_ok, signed_response = send_cluster_http(
+        peer_ip,
+        signed_target_port,
+        "/api/cluster/interfaces",
+        secret,
+        {},
+        timeout=timeout,
+        strict_port=True,
+    )
+    signed_interfaces = None
+    signed_error = str(signed_response) if not signed_ok else "Remote response did not include interfaces"
+    if signed_ok and isinstance(signed_response, dict) and signed_response.get("ok"):
+        signed_interfaces = normalize_network_interfaces(signed_response.get("interfaces"))
+        if signed_interfaces:
+            cached_peer = PEER_VERSION_CACHE.setdefault(peer_ip, {})
+            cached_peer["interfaces"] = signed_interfaces
+            if signed_target_port:
+                cached_peer["port"] = signed_target_port
+            cached_peer["timestamp"] = time.time()
+            return signed_interfaces, ""
+
+    if cached_interfaces:
+        return cached_interfaces, "Used cached interface metadata from the peer probe."
+
+    errors = [error for error in (signed_error, info_error) if error]
+    return [], "; ".join(dict.fromkeys(errors))
+
+
+def is_local_origin(origin_node):
+    """Check if the provided origin_node represents the local machine."""
+    origin = (origin_node or "").strip()
+    if not origin or origin in ("local", "127.0.0.1"):
+        return True
+    cfg = load_env_file(CONFIG_FILE)
+    local_ip = cfg.get("IPV4", "").strip()
+    return bool(local_ip and origin == local_ip)
+
+
+TUNNEL_TYPES = ("haproxy", "iptables", "gost", "realm")
+TUNNEL_CACHE = {}  # peer ip -> {"tunnels": {...}, "name": str, "fetched_at": ts}
+TUNNEL_CACHE_LOCK = threading.Lock()
+TUNNEL_FETCH_TIMEOUT = 3.0
+TUNNEL_FETCH_DEADLINE = 8.0
+
+
+def get_tunnel_nodes():
+    """Return (local node, reachable mesh peers) for the tunnels view."""
+    cfg = load_env_file(CONFIG_FILE)
+    local_ip = cfg.get("IPV4", "127.0.0.1")
+    local_node = {"ip": local_ip, "name": cfg.get("HOSTNAME", "local")}
+
+    peers_raw = get_easytier_peers() or []
+    if isinstance(peers_raw, dict):
+        peers_raw = peers_raw.get("peers", []) or []
+
+    peers, seen = [], set()
+    for p in peers_raw:
+        if not isinstance(p, dict):
+            continue
+        vip = str(p.get("ipv4", "")).strip()
+        cost = str(p.get("cost", "0"))
+        if vip and vip != local_ip and vip not in seen and cost not in ("0", "Local", "none", ""):
+            seen.add(vip)
+            peers.append({"ip": vip, "name": p.get("hostname") or vip})
+    return local_node, peers
+
+
+def tag_tunnels(tunnels, ip, name, is_local=False):
+    """Stamp each tunnel with the node that runs it, so edits and deletes reach that node."""
+    out = {}
+    for t_type in TUNNEL_TYPES:
+        items = []
+        for item in tunnels.get(t_type, []) or []:
+            if isinstance(item, dict):
+                items.append(dict(item, _node_ip=ip, _node_name=name, _is_local=is_local))
+        out[t_type] = items
+    return out
+
+
+def tunnel_cache_fallback(peer, status, error):
+    """Serve the last good tunnel list for a peer that failed to answer."""
+    with TUNNEL_CACHE_LOCK:
+        cached = TUNNEL_CACHE.get(peer["ip"])
+    node = {
+        "ip": peer["ip"],
+        "name": (cached or {}).get("name") or peer["name"],
+        "is_local": False,
+        "status": status,
+        "error": error,
+        "stale": bool(cached),
+        "fetched_at": (cached or {}).get("fetched_at"),
+    }
+    data = (cached or {}).get("tunnels") or {t: [] for t in TUNNEL_TYPES}
+    return data, node
+
+
+def fetch_remote_tunnels(peer):
+    """Fetch one peer's tunnels with a retry; fall back to the cached copy on failure."""
+    cfg = load_env_file(CONFIG_FILE)
+    secret = cfg.get("NETWORK_SECRET", "").strip()
+    known_port = PEER_VERSION_CACHE.get(peer["ip"], {}).get("port")
+    # Lossy links: first try the port that answered before, then widen the search once.
+    attempts = [(known_port, True), (PORT, False)] if known_port else [(PORT, False), (PORT, False)]
+
+    status, error = "unreachable", "Failed to connect to cluster peer"
+    for port, strict in attempts:
+        started = time.time()
+        ok, res, http_status = cluster_request(
+            peer["ip"], port, "/api/cluster/tunnels", secret, {}, TUNNEL_FETCH_TIMEOUT, strict
+        )
+        if ok and isinstance(res, dict) and res.get("ok"):
+            name = res.get("node_name") or peer["name"]
+            data = tag_tunnels(res.get("tunnels") or {}, peer["ip"], name)
+            now = time.time()
+            with TUNNEL_CACHE_LOCK:
+                TUNNEL_CACHE[peer["ip"]] = {"tunnels": data, "name": name, "fetched_at": now}
+            return data, {
+                "ip": peer["ip"], "name": name, "is_local": False, "status": "ok",
+                "stale": False, "fetched_at": now, "latency_ms": int((now - started) * 1000),
+            }
+        status = cluster_error_code(http_status)
+        error = res.get("error") if isinstance(res, dict) else str(res)
+        if status in ("auth_failed", "unsupported"):
+            break  # Retrying will not change a definitive answer.
+    return tunnel_cache_fallback(peer, status, error)
+
+
+TUNNEL_ACTION_RE = re.compile(r"^/api/tunnels/(haproxy|iptables|gost|realm)/(create|edit|delete)$")
+TUNNEL_ENGINE_LABELS = {"haproxy": "HAProxy", "iptables": "iptables", "gost": "GOST", "realm": "Realm"}
+TUNNEL_ACTION_DONE = {"create": "created", "edit": "updated", "delete": "deleted"}
+TUNNEL_NAME_ERROR = "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."
+# The first tunnel of an engine installs it (apt packages plus a binary download), which can take minutes.
+TUNNEL_CMD_TIMEOUT = 240
+TUNNEL_PROXY_TIMEOUT = TUNNEL_CMD_TIMEOUT + 30
+TUNNEL_CMD_LOCK = threading.Lock()  # engines rewrite one shared config, so changes run one at a time
+
+
+def tunnel_field(data, key, default=""):
+    value = data.get(key)
+    return default if value is None else str(value).strip()
+
+
+def build_tunnel_command(t_type, action, data):
+    """Validate a tunnel change and return (sutun.sh args, error)."""
+    if t_type not in TUNNEL_TYPES or action not in TUNNEL_ACTION_DONE:
+        return None, f"Invalid tunnel request: {t_type} {action}"
+    name = tunnel_field(data, "name")
+    if not name:
+        return None, "Missing tunnel name"
+    if not valid_tunnel_name(name):
+        return None, TUNNEL_NAME_ERROR
+    if action == "delete":
+        return [f"{t_type}-delete", name], ""
+
+    target, ports = tunnel_field(data, "target"), tunnel_field(data, "ports")
+    if not target or not ports:
+        return None, "Missing required fields: name, target, ports"
+    if not IPV4_RE.match(target):
+        return None, "Target must be a valid IPv4 mesh address."
+    args = [f"{t_type}-{action}", name, target, ports]
+    if t_type == "haproxy":
+        return args, ""
+
+    default_proto = "udp" if t_type == "iptables" else "both"
+    protocol = tunnel_field(data, "protocol").lower().replace(" ", "") or default_proto
+    if protocol in ("tcp,udp", "tcp+udp", "udp,tcp"):
+        protocol = "both"
+    if protocol not in ("tcp", "udp", "both"):
+        return None, "Protocol must be tcp, udp, or both."
+    args.append(protocol)
+    if t_type == "iptables":
+        args += [tunnel_field(data, "interface") or "any", tunnel_field(data, "source_cidr") or "0.0.0.0/0"]
+    return args, ""
+
+
+def run_tunnel_command(t_type, action, data):
+    """Apply a tunnel change on this node; returns (ok, message)."""
+    args, err = build_tunnel_command(t_type, action, data)
+    if not args:
+        return False, err
+    with TUNNEL_CMD_LOCK:
+        ok, msg = run_sutun_cmd(args, timeout=TUNNEL_CMD_TIMEOUT)
+    label = TUNNEL_ENGINE_LABELS[t_type]
+    if ok:
+        return True, msg or f"{label} tunnel {TUNNEL_ACTION_DONE[action]} successfully."
+    verb = "update" if action == "edit" else action
+    return False, msg or f"Failed to {verb} {label} tunnel."
+
+
+def proxy_tunnel_request(origin_node, t_type, action, data):
+    """Apply a tunnel change on another mesh node; returns (ok, message, http status)."""
+    if not IPV4_RE.match(origin_node):
+        return False, "Origin server must be a mesh IPv4 address.", 400
+    args, err = build_tunnel_command(t_type, action, data)
+    if not args:
+        return False, err, 400  # Reject bad input here instead of bothering the peer.
+    secret = load_env_file(CONFIG_FILE).get("NETWORK_SECRET", "").strip()
+    if not secret:
+        return False, "Cluster secret not configured on this node", 500
+
+    # Probe first: an offline node fails in seconds instead of holding the request for the full command timeout.
+    info, port, probe_err = {}, None, ""
+    for _ in range(2):  # lossy links drop single probes
+        info, port, probe_err = fetch_peer_cluster_info(
+            origin_node, PEER_VERSION_CACHE.get(origin_node, {}).get("port"), timeout=4.0
+        )
+        if info:
+            break
+    if not info:
+        return False, f"Node {origin_node} is not reachable over the mesh ({probe_err}).", 502
+
+    payload = {k: v for k, v in data.items() if k != "origin_node"}
+    payload["tunnel_type"] = t_type
+    ok, res, http_status = cluster_request(
+        origin_node, port, f"/api/cluster/tunnel/{action}", secret, payload,
+        TUNNEL_PROXY_TIMEOUT, strict_port=True, stop_on_timeout=True,
+    )
+    if ok and isinstance(res, dict) and res.get("ok"):
+        label = TUNNEL_ENGINE_LABELS[t_type]
+        return True, res.get("message") or f"{label} tunnel {TUNNEL_ACTION_DONE[action]} on node {origin_node}.", 200
+
+    err = (res.get("error") if isinstance(res, dict) else str(res)) or "Request to the peer failed."
+    if http_status == 403:
+        return False, f"Node {origin_node} rejected the request ({err}). Both nodes must share the same network secret.", 502
+    if http_status == 404:
+        return False, f"Node {origin_node} runs an SuTun version that cannot manage tunnels remotely. Update it first.", 502
+    if http_status is None and "timed out" in err:
+        return False, (
+            f"Node {origin_node} did not answer within {TUNNEL_PROXY_TIMEOUT}s. "
+            "The change may still finish there; refresh the list in a minute."
+        ), 504
+    return False, f"Remote node {origin_node} error: {err}", 502 if http_status is None else 400
+
+
+IPV4_RE = re.compile(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
+IPERF_BANDWIDTH_RE = re.compile(r"^\d+(?:\.\d+)?[KMG]?$")
+# One iperf3 report row, e.g. "[  5]   1.00-2.00   sec  2.23 GBytes  19133 Mbits/sec    0   1023 KBytes".
+IPERF_LINE_RE = re.compile(
+    r"^\[\s*\d+\]\s+([\d.]+)-([\d.]+)\s+sec\s+([\d.]+)\s+([KMGT]?)Bytes\s+([\d.]+)\s+([KMGT]?)bits/sec\s*(.*)$"
+)
+IPERF_UDP_TOTALS_RE = re.compile(r"([\d.]+)\s*ms\s+(\d+)/(\d+)\s*\(([^)%]*)%\)")
+IPERF_BYTE_UNITS = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+IPERF_BIT_UNITS = {"": 1, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+PING_REPLY_RE = re.compile(r"(?:icmp_)?seq=(\d+)\s+ttl=(\d+)\s+time[=<]\s*([\d.]+)\s*ms")
+PING_TIMEOUT_RE = re.compile(r"no answer yet for icmp_seq=(\d+)")
+PING_ERROR_RE = re.compile(r"^From\s+\S+.*?icmp_seq=(\d+)\s+(.+)$")
+_IPERF_FORCEFLUSH = None
+_PING_IPUTILS = None
+
+
+def iperf_supports_forceflush():
+    """iperf3 buffers its reports on a pipe unless --forceflush (3.1.5+) is available."""
+    global _IPERF_FORCEFLUSH
+    if _IPERF_FORCEFLUSH is None:
+        try:
+            res = subprocess.run(["iperf3", "--help"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            _IPERF_FORCEFLUSH = "--forceflush" in res.stdout
+        except Exception:
+            _IPERF_FORCEFLUSH = False
+    return _IPERF_FORCEFLUSH
+
+
+def ping_is_iputils():
+    """iputils ping reports unanswered probes live with -O; BusyBox ping has no such flag."""
+    global _PING_IPUTILS
+    if _PING_IPUTILS is None:
+        try:
+            res = subprocess.run(["ping", "-V"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5)
+            _PING_IPUTILS = "iputils" in res.stdout
+        except Exception:
+            _PING_IPUTILS = False
+    return _PING_IPUTILS
+
+
+def run_streaming_command(cmd, timeout, on_line):
+    """Run cmd, handing every output line to on_line as it is printed.
+    Returns (returncode, full_output, timed_out)."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    timed_out = threading.Event()
+
+    def kill():
+        timed_out.set()
+        proc.kill()
+
+    timer = threading.Timer(timeout, kill)
+    timer.daemon = True
+    timer.start()
+    lines = []
+    try:
+        for line in proc.stdout:
+            lines.append(line)
+            try:
+                on_line(line)
+            except Exception:
+                pass
+        proc.wait()
+    finally:
+        timer.cancel()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    return proc.returncode, "".join(lines), timed_out.is_set()
+
+
+def parse_iperf_line(line):
+    """Parse one iperf3 text report row (per-second interval or final sender/receiver total)."""
+    m = IPERF_LINE_RE.match(line.strip())
+    if not m:
+        return None
+    rest = m.group(7).strip()
+    role = None
+    for suffix in ("sender", "receiver"):
+        if rest.endswith(suffix):
+            role = suffix
+            rest = rest[: -len(suffix)].strip()
+            break
+    row = {
+        "start": float(m.group(1)),
+        "end": float(m.group(2)),
+        "bytes": int(float(m.group(3)) * IPERF_BYTE_UNITS[m.group(4)]),
+        "mbps": round(float(m.group(5)) * IPERF_BIT_UNITS[m.group(6)] / 1e6, 2),
+        "role": role,
+    }
+    udp = IPERF_UDP_TOTALS_RE.search(rest)
+    if udp:
+        row["jitter_ms"] = float(udp.group(1))
+        row["lost_packets"] = int(udp.group(2))
+        row["total_packets"] = int(udp.group(3))
+        try:
+            row["loss_percent"] = float(udp.group(4))
+        except ValueError:
+            row["loss_percent"] = round(100.0 * row["lost_packets"] / row["total_packets"], 2) if row["total_packets"] else 0.0
+    else:
+        first = rest.split()[0] if rest.split() else ""
+        if first.isdigit():
+            # Retransmits on TCP rows, datagrams sent on UDP interval rows.
+            row["count"] = int(first)
+    return row
+
+
+def execute_iperf_benchmark(target, protocol="tcp", duration=5, bandwidth="50M", port=5201, source_ip=None, on_progress=None):
+    """Run an iperf3 client. on_progress(event, data) is called with ("connected", None) once the
+    control connection is up and ("interval", row) for every per-second report."""
+    if not IPV4_RE.match(target):
+        return False, "Invalid target IP", 400
+
+    if protocol not in ("tcp", "udp"):
+        protocol = "tcp"
+    if not IPERF_BANDWIDTH_RE.match(bandwidth or ""):
+        bandwidth = "50M"
+
+    if not shutil.which("iperf3"):
+        return False, "iperf3 is not installed on this server. Run sudo ./sutun.sh web to install.", 500
+
+    cmd = ["iperf3", "-c", target, "-p", str(port), "-t", str(duration), "-f", "m"]
+    if iperf_supports_forceflush():
+        cmd.append("--forceflush")
+    if protocol == "udp":
+        cmd.extend(["-u", "-b", bandwidth])
+
+    intervals = []
+    totals = {}
+
+    def on_line(line):
+        if " connected to " in line and on_progress:
+            on_progress("connected", None)
+            return
+        row = parse_iperf_line(line)
+        if not row:
+            return
+        if row["role"]:
+            totals[row["role"]] = row
+            return
+        sample = {
+            "start": row["start"],
+            "end": row["end"],
+            "interval": row["start"],
+            "mbps": row["mbps"],
+            "bytes": row["bytes"],
+        }
+        if protocol == "tcp" and "count" in row:
+            sample["retransmits"] = row["count"]
+        intervals.append(sample)
+        if on_progress:
+            on_progress("interval", sample)
+
+    try:
+        # Add 8s grace period to timeout
+        code, output, timed_out = run_streaming_command(cmd, duration + 8, on_line)
+    except Exception as e:
+        return False, str(e), 500
+
+    if timed_out:
+        return False, "iperf3 test timed out. Ensure the target node is running an iperf3 server on port 5201.", 504
+
+    err = re.search(r"iperf3:\s*error\s*-\s*(.+)", output)
+    if err:
+        return False, err.group(1).strip(), 500
+    if code != 0 or not totals:
+        return False, output.strip().splitlines()[-1] if output.strip() else "No output from iperf3 test", 500
+
+    sender = totals.get("sender", {})
+    receiver = totals.get("receiver", {})
+    if protocol == "tcp":
+        summary = {
+            "sent_mbps": sender.get("mbps", 0),
+            "received_mbps": receiver.get("mbps", 0),
+            "total_bytes_sent": sender.get("bytes", 0),
+            "total_bytes_received": receiver.get("bytes", 0),
+            "retransmits": sender.get("count", 0),
+        }
+    else:
+        # The receiver row carries the server-measured jitter and loss.
+        udp = receiver or sender
+        summary = {
+            "mbps": udp.get("mbps", 0),
+            "total_bytes": udp.get("bytes", 0),
+            "jitter_ms": round(udp.get("jitter_ms", 0), 3),
+            "lost_packets": udp.get("lost_packets", 0),
+            "total_packets": udp.get("total_packets", 0),
+            "loss_percent": round(udp.get("loss_percent", 0), 2),
+        }
+
+    return True, {
+        "source": source_ip or "local",
+        "target": target,
+        "protocol": protocol,
+        "duration": duration,
+        "error": None,
+        "intervals": intervals,
+        "summary": summary,
+    }, 200
+
+
+def execute_ping_benchmark(target, count=4, source_ip=None, on_progress=None):
+    """Ping target. on_progress(event, data) is called with ("reply", sample) for every answered,
+    unanswered or rejected probe as ping reports it."""
+    if not IPV4_RE.match(target):
+        return False, "Invalid target IP", 400
+
+    count = min(max(int(count), 1), 10)
+    cmd = ["ping", "-c", str(count), "-W", "2"]
+    if ping_is_iputils():
+        cmd.append("-O")
+    cmd.append(target)
+
+    replies = {}
+
+    def on_line(line):
+        sample = None
+        m = PING_REPLY_RE.search(line)
+        if m:
+            sample = {"seq": int(m.group(1)), "status": "ok", "ttl": int(m.group(2)), "time_ms": float(m.group(3))}
+        else:
+            m = PING_TIMEOUT_RE.search(line)
+            if m:
+                sample = {"seq": int(m.group(1)), "status": "timeout", "time_ms": None}
+            else:
+                m = PING_ERROR_RE.match(line.strip())
+                if m:
+                    sample = {"seq": int(m.group(1)), "status": "error", "time_ms": None, "message": m.group(2).strip()}
+        # A late reply may follow "no answer yet"; never let a duplicate overwrite it.
+        if not sample or replies.get(sample["seq"], {}).get("status") == "ok":
+            return
+        replies[sample["seq"]] = sample
+        if on_progress:
+            on_progress("reply", sample)
+
+    try:
+        _, output, timed_out = run_streaming_command(cmd, count * 2 + 5, on_line)
+    except Exception as e:
+        return False, str(e), 500
+    if timed_out and not replies:
+        return False, "Ping request timed out", 504
+
+    stats = {
+        "source": source_ip or "local",
+        "target": target,
+        "count": count,
+        "raw": output,
+        "packets_sent": count,
+        "packets_received": 0,
+        "packet_loss_percent": 100.0,
+        "min_ms": 0.0,
+        "avg_ms": 0.0,
+        "max_ms": 0.0,
+        "mdev_ms": 0.0,
+        "replies": [],
+    }
+
+    loss_match = re.search(r"([\d.]+)% packet loss", output)
+    if loss_match:
+        stats["packet_loss_percent"] = float(loss_match.group(1))
+
+    rx_match = re.search(r"(\d+)\s+(?:packets\s+)?received", output)
+    if rx_match:
+        stats["packets_received"] = int(rx_match.group(1))
+
+    rtt_match = re.search(r"(?:rtt|round-trip)\s+min/avg/max/(?:mdev|stddev)\s*=\s*([0-9.]+)/([0-9.]+)/([0-9.]+)/([0-9.]+)", output)
+    if rtt_match:
+        stats["min_ms"] = float(rtt_match.group(1))
+        stats["avg_ms"] = float(rtt_match.group(2))
+        stats["max_ms"] = float(rtt_match.group(3))
+        stats["mdev_ms"] = float(rtt_match.group(4))
+
+    # BusyBox numbers probes from 0; iputils from 1. Anything never answered is lost.
+    first_seq = 0 if 0 in replies else 1
+    stats["replies"] = [
+        replies.get(seq, {"seq": seq, "status": "timeout", "time_ms": None})
+        for seq in range(first_seq, first_seq + count)
+    ]
+    return True, stats, 200
+
+
+# ─── Live benchmarks ─────────────────────────────────────────────────────────
+# A live test runs on a background thread; the browser polls its snapshot to
+# animate intervals and replies as they arrive. When another node runs the test,
+# this node mirrors that node's live job over signed cluster requests.
+
+LIVE_TESTS = {}
+LIVE_TESTS_LOCK = threading.Lock()
+LIVE_TEST_RETENTION_SEC = 300
+LIVE_TEST_MAX_RUNNING = 6
+LIVE_POLL_INTERVAL_SEC = 0.5
+
+
+def prune_live_tests():
+    now = time.time()
+    with LIVE_TESTS_LOCK:
+        for job_id in [
+            jid for jid, job in LIVE_TESTS.items()
+            if job["status"] != "running" and now - job["updated"] > LIVE_TEST_RETENTION_SEC
+        ]:
+            del LIVE_TESTS[job_id]
+
+
+def create_live_test(kind, params):
+    """Register a live test, or return None when too many are already running."""
+    prune_live_tests()
+    with LIVE_TESTS_LOCK:
+        running = sum(1 for job in LIVE_TESTS.values() if job["status"] == "running")
+        if running >= LIVE_TEST_MAX_RUNNING:
+            return None
+        now = time.time()
+        job = {
+            "id": uuid.uuid4().hex,
+            "kind": kind,
+            "status": "running",
+            "phase": "connecting",
+            "params": dict(params),
+            "samples": [],
+            "result": None,
+            "error": None,
+            "started": now,
+            "updated": now,
+        }
+        LIVE_TESTS[job["id"]] = job
+        return job
+
+
+def update_live_test(job, **fields):
+    with LIVE_TESTS_LOCK:
+        job.update(fields)
+        job["updated"] = time.time()
+
+
+def add_live_sample(job, sample):
+    with LIVE_TESTS_LOCK:
+        job["samples"].append(sample)
+        job["phase"] = "running"
+        job["updated"] = time.time()
+
+
+def finish_live_test(job, ok, res):
+    if ok:
+        update_live_test(job, status="done", phase="done", result=res)
+    else:
+        update_live_test(job, status="error", phase="done", error=str(res))
+
+
+def live_test_snapshot(job_id):
+    with LIVE_TESTS_LOCK:
+        job = LIVE_TESTS.get(job_id)
+        if not job:
+            return None
+        return {
+            "id": job["id"],
+            "kind": job["kind"],
+            "status": job["status"],
+            "phase": job["phase"],
+            "params": dict(job["params"]),
+            "samples": list(job["samples"]),
+            "result": job["result"],
+            "error": job["error"],
+            "elapsed": round(time.time() - job["started"], 2),
+        }
+
+
+def run_local_live_test(job, local_ip):
+    params = job["params"]
+
+    def on_progress(event, data):
+        if event == "connected":
+            update_live_test(job, phase="running")
+        else:
+            add_live_sample(job, data)
+
+    try:
+        if job["kind"] == "ping":
+            update_live_test(job, phase="running")
+            ok, res, _ = execute_ping_benchmark(params["target"], count=params["count"], source_ip=local_ip, on_progress=on_progress)
+        else:
+            ok, res, _ = execute_iperf_benchmark(
+                params["target"], params["protocol"], params["duration"], params["bandwidth"], params["port"],
+                source_ip=local_ip, on_progress=on_progress,
+            )
+    except Exception as e:
+        ok, res = False, str(e)
+    finish_live_test(job, ok, res)
+
+
+def run_remote_live_test(job, source, secret):
+    """Start the test on the source node and mirror its live job here. Nodes that predate live
+    tests answer the start request with 401/404; for those, fall back to the blocking endpoint."""
+    params = job["params"]
+    kind = job["kind"]
+    payload = {k: v for k, v in params.items() if k not in ("source",)}
+    peer_port = PEER_VERSION_CACHE.get(source, {}).get("port", PORT)
+    if kind == "ping":
+        legacy_endpoint, legacy_timeout = "/api/cluster/ping/run", params["count"] * 2 + 10
+        deadline = time.time() + params["count"] * 2 + 20
+    else:
+        legacy_endpoint, legacy_timeout = "/api/cluster/iperf/run", params["duration"] + 15
+        deadline = time.time() + params["duration"] + 30
+
+    def finish_with_source(ok, res):
+        if ok and isinstance(res, dict):
+            res["source"] = source
+            res["target"] = params["target"]
+        finish_live_test(job, ok, res)
+
+    try:
+        ok, res, status = cluster_request(source, peer_port, f"/api/cluster/{kind}/start", secret, payload, timeout=8)
+        if not ok and status in (401, 404):
+            ok, res = send_cluster_http(source, peer_port, legacy_endpoint, secret, payload, timeout=legacy_timeout)
+            if ok and isinstance(res, dict) and res.get("ok"):
+                finish_with_source(True, res.get("data", {}))
+            else:
+                err = res.get("error") if isinstance(res, dict) else str(res)
+                finish_live_test(job, False, f"Remote node {source} error: {err}")
+            return
+        if not ok or not isinstance(res, dict) or not res.get("ok"):
+            err = res.get("error") if isinstance(res, dict) else str(res)
+            finish_live_test(job, False, f"Remote node {source} error: {err}")
+            return
+
+        remote_id = res.get("job_id", "")
+        failures = 0
+        while time.time() < deadline:
+            time.sleep(LIVE_POLL_INTERVAL_SEC)
+            ok, res, _ = cluster_request(source, peer_port, "/api/cluster/live/status", secret, {"job_id": remote_id}, timeout=5)
+            remote = res.get("job") if ok and isinstance(res, dict) and res.get("ok") else None
+            if not isinstance(remote, dict):
+                failures += 1
+                if failures >= 6:
+                    err = res.get("error") if isinstance(res, dict) else str(res)
+                    finish_live_test(job, False, f"Remote node {source} error: {err}")
+                    return
+                continue
+            failures = 0
+            update_live_test(job, phase=remote.get("phase", "running"), samples=list(remote.get("samples") or []))
+            if remote.get("status") == "done":
+                finish_with_source(True, remote.get("result") or {})
+                return
+            if remote.get("status") == "error":
+                finish_live_test(job, False, f"Remote node {source} error: {remote.get('error')}")
+                return
+        finish_live_test(job, False, f"Remote node {source} did not finish the test in time")
+    except Exception as e:
+        finish_live_test(job, False, f"Remote node {source} error: {e}")
+
+
+def start_live_test(kind, params, local_ip, secret=""):
+    """Create and start a live test. Returns (job, error_message, http_status)."""
+    job = create_live_test(kind, params)
+    if not job:
+        return None, "Too many tests are running. Wait for one to finish and try again.", 429
+    source = params.get("source", "")
+    if source and source not in ("local", "127.0.0.1", local_ip):
+        if not secret:
+            update_live_test(job, status="error", phase="done", error="Cluster secret not configured on this node")
+            return None, "Cluster secret not configured on this node", 500
+        target_fn, args = run_remote_live_test, (job, source, secret)
+    else:
+        target_fn, args = run_local_live_test, (job, local_ip)
+    threading.Thread(target=target_fn, args=args, daemon=True).start()
+    return job, "", 200
+
+
+def parse_ping_request(data):
+    """Validate a ping request body. Returns (params, error)."""
+    target = str(data.get("target", "")).strip()
+    source = str(data.get("source", "")).strip()
+    try:
+        count = min(max(int(data.get("count", 4)), 1), 10)
+    except (TypeError, ValueError):
+        count = 4
+    if not IPV4_RE.match(target):
+        return None, "Invalid target IP"
+    if source and target == source:
+        return None, "Source and target cannot be the same node"
+    return {"target": target, "source": source, "count": count}, ""
+
+
+def parse_iperf_request(data):
+    """Validate a speed test request body. Returns (params, error)."""
+    target = str(data.get("target", "")).strip()
+    source = str(data.get("source", "")).strip()
+    protocol = str(data.get("protocol", "tcp")).lower()
+    bandwidth = str(data.get("bandwidth", "50M")).strip()
+    try:
+        duration = min(max(int(data.get("duration", 5)), 1), 30)
+    except (TypeError, ValueError):
+        duration = 5
+    try:
+        port = int(data.get("port", 5201))
+    except (TypeError, ValueError):
+        port = 5201
+    if not IPV4_RE.match(target):
+        return None, "Invalid target IP"
+    if source and target == source:
+        return None, "Source and target cannot be the same node"
+    if not 1 <= port <= 65535:
+        return None, "Invalid iperf3 port"
+    return {
+        "target": target,
+        "source": source,
+        "protocol": protocol if protocol in ("tcp", "udp") else "tcp",
+        "duration": duration,
+        "bandwidth": bandwidth if IPERF_BANDWIDTH_RE.match(bandwidth) else "50M",
+        "port": port,
+    }, ""
+
+
+# ─── Installable web app (PWA) ───────────────────────────────────────────
+# Only server.py and index.html ship to nodes, so the manifest and home-screen
+# icons are generated here instead of living as extra static files.
+
+APP_ICON_SIZES = (180, 192, 512)
+APP_BG_RGB = (0x14, 0x19, 0x20)
+APP_ACCENT_RGB = (0x2D, 0xD4, 0xBF)
+
+
+def web_app_manifest():
+    icons = [
+        {"src": f"icon-{size}.png", "sizes": f"{size}x{size}", "type": "image/png", "purpose": "any"}
+        for size in APP_ICON_SIZES if size != 180
+    ]
+    icons.append({"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"})
+    return {
+        "id": "/",
+        "name": "SuTun",
+        "short_name": "SuTun",
+        "description": "SuTun cluster dashboard",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "orientation": "any",
+        "background_color": "#0b0e13",
+        "theme_color": "#0b0e13",
+        "icons": icons,
+    }
+
+
+def _capsule_dist(px, py, ax, ay, bx, by, radius):
+    dx, dy = bx - ax, by - ay
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    return ((px - ax - t * dx) ** 2 + (py - ay - t * dy) ** 2) ** 0.5 - radius
+
+
+def _disc_dist(px, py, cx, cy, radius):
+    return ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5 - radius
+
+
+@functools.lru_cache(maxsize=len(APP_ICON_SIZES))
+def render_app_icon(size):
+    """Rasterize the favicon mark as a full-bleed PNG; the OS applies its own corner mask."""
+    # Shapes in the favicon's 64-unit space, painted in order: (distance fn, color).
+    shapes = (
+        (lambda x, y: _capsule_dist(x, y, 20, 20, 44, 44, 2.5), APP_ACCENT_RGB),
+        (lambda x, y: _capsule_dist(x, y, 44, 20, 20, 44, 2.5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 20, 20, 5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 44, 20, 5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 20, 44, 5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 44, 44, 5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 32, 32, 7.5), APP_ACCENT_RGB),
+        (lambda x, y: _disc_dist(x, y, 32, 32, 4.5), APP_BG_RGB),
+    )
+    unit = 64.0 / size
+    rows = []
+    for j in range(size):
+        y = (j + 0.5) * unit
+        row = bytearray(b"\x00")  # PNG filter type: none
+        for i in range(size):
+            x = (i + 0.5) * unit
+            r, g, b = APP_BG_RGB
+            if 13 <= x <= 51 and 13 <= y <= 51:
+                for dist, color in shapes:
+                    alpha = 0.5 - dist(x, y) / unit
+                    if alpha <= 0:
+                        continue
+                    alpha = min(alpha, 1.0)
+                    r += (color[0] - r) * alpha
+                    g += (color[1] - g) * alpha
+                    b += (color[2] - b) * alpha
+            row += bytes((int(r + 0.5), int(g + 0.5), int(b + 0.5)))
+        rows.append(bytes(row))
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)  # 8-bit RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+class SuTunHandler(http.server.BaseHTTPRequestHandler):
+    """Custom HTTP handler with REST API and Single Page Application routing."""
+
+    server_version = f"SuTun-Web/{CURRENT_VERSION}"
+
+    def log_message(self, format, *args):
+        # Suppress noisy standard logging, only print relevant notices
+        pass
+
+    def send_json(self, data, status=200, headers=None):
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def serve_static(self, filepath, content_type="text/html; charset=utf-8", extra_headers=None):
+        if not os.path.isfile(filepath):
+            self.send_error(404, "File not found")
+            return
+        try:
+            with open(filepath, "rb") as f:
+                content = f.read()
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(content)
+        except Exception as e:
+            self.send_error(500, f"Error reading file: {e}")
+
+    def send_bytes(self, content, content_type, max_age=86400):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", f"public, max-age={max_age}")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Server", f"SuTun-Web/{CURRENT_VERSION}")
+        self.end_headers()
+
+    def send_response(self, code, message=None):
+        self._response_started = True
+        super().send_response(code, message)
+
+    def run_safely(self, handler):
+        """Answer with a JSON 500 when a handler crashes, instead of dropping the connection
+        (which the browser only reports as a bare NetworkError)."""
+        self._response_started = False
+        try:
+            handler()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The client went away.
+        except Exception as e:
+            print(f"[!] {self.command} {self.path} failed:", flush=True)
+            traceback.print_exc()
+            if self._response_started:
+                self.close_connection = True
+                return
+            try:
+                self.send_json({"ok": False, "error": f"Internal server error: {e}"}, status=500)
+            except Exception:
+                self.close_connection = True
+
+    def do_GET(self):
+        self.run_safely(self.handle_get)
+
+    def do_POST(self):
+        self.run_safely(self.handle_post)
+
+    def handle_get(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+
+        # Check token parameter in URL for one-click browser entry (scope to web dashboard root)
+        if path in ("/", "/index.html") and "token" in query:
+            token = query["token"]
+            if validate_token(token):
+                session_id = create_session()
+                # Redirect to clean URL '/' with Set-Cookie
+                cookie_val = get_session_cookie(session_id)
+                self.send_response(302)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", cookie_val)
+                self.end_headers()
+                return
+
+        # Check authentication for API endpoints
+        auth_ok, session_or_token = is_authenticated(self.headers, query)
+
+        # Static root
+        if path == "/" or path == "/index.html":
+            index_path = os.path.join(STATIC_DIR, "index.html")
+            self.serve_static(index_path, "text/html; charset=utf-8")
+            return
+
+        # Web app manifest and home-screen icons (public, like the page itself)
+        if path == "/manifest.webmanifest":
+            self.send_bytes(json.dumps(web_app_manifest()).encode("utf-8"), "application/manifest+json")
+            return
+        icon_match = re.fullmatch(r"/(?:icon-(\d+)|apple-touch-icon(?:-precomposed)?)\.png", path)
+        if icon_match:
+            size = int(icon_match.group(1) or 180)
+            if size in APP_ICON_SIZES:
+                self.send_bytes(render_app_icon(size), "image/png")
+            else:
+                self.send_error(404, "File not found")
+            return
+
+        # Auth status check
+        if path == "/api/auth/status":
+            web_cfg = load_env_file(WEB_ENV_FILE)
+            has_pw = bool(web_cfg.get("WEB_PASSWORD_HASH"))
+            node_cfg = load_env_file(CONFIG_FILE)
+            is_node_configured = os.path.isfile(CONFIG_FILE) and bool(node_cfg.get("IPV4"))
+            self.send_json({
+                "authenticated": auth_ok,
+                "password_configured": has_pw,
+                "node_configured": is_node_configured
+            })
+            return
+
+        # Mesh inter-node version/node info probe (unauthenticated for cluster peers)
+        if path == "/api/cluster/info":
+            config = load_env_file(CONFIG_FILE)
+            info = {
+                "ok": True,
+                "hostname": config.get("HOSTNAME", ""),
+                "ipv4": config.get("IPV4", ""),
+                "interfaces": get_network_interfaces()
+            }
+            # version, branch, channel, latest_version, update_available and the update job summary.
+            info.update(local_update_summary())
+            self.send_json(info)
+            return
+
+        # Protected API endpoints below
+        if not auth_ok:
+            self.send_json({"error": "Unauthorized", "authenticated": False}, status=401)
+            return
+
+        if path == "/api/version":
+            self.send_json({
+                "ok": True,
+                "data": get_version_info(force=query.get("refresh") == "1")
+            })
+            return
+
+        elif path == "/api/update/status":
+            info = get_version_info()
+            summary = local_update_summary()
+            summary["latest_version"] = info.get("latest_version", "")
+            summary["update_available"] = bool(info.get("update_available"))
+            summary["checked"] = bool(info.get("checked"))
+            self.send_json({"ok": True, "data": summary})
+            return
+
+        elif path == "/api/status":
+            config = load_env_file(CONFIG_FILE)
+            system_stats = get_system_stats()
+
+            # EasyTier Service Status
+            svc_active = False
+            try:
+                r = subprocess.run(["systemctl", "is-active", "--quiet", "sutun.service"], timeout=3)
+                svc_active = (r.returncode == 0)
+            except Exception:
+                pass
+
+            # EasyTier Version
+            et_ver = "unknown"
+            ver_file = os.path.join(INSTALL_DIR, "easytier.version")
+            if os.path.isfile(ver_file):
+                try:
+                    with open(ver_file, "r") as vf:
+                        et_ver = vf.read().strip()
+                except Exception:
+                    pass
+
+            web_cfg = load_env_file(WEB_ENV_FILE)
+            default_host = os.uname().nodename if hasattr(os, "uname") else "node"
+            is_node_configured = os.path.isfile(CONFIG_FILE) and bool(config.get("IPV4"))
+            self.send_json({
+                "node": {
+                    "configured": is_node_configured,
+                    "network_name": config.get("NETWORK_NAME", ""),
+                    "hostname": config.get("HOSTNAME", default_host),
+                    "ipv4": config.get("IPV4", ""),
+                    "protocol": config.get("PROTOCOL", "dual"),
+                    "port": config.get("PORT", "11010"),
+                    "encryption": config.get("ENCRYPTION", "yes"),
+                    "service_active": svc_active,
+                    "easytier_version": et_ver,
+                    "sutun_version": CURRENT_VERSION,
+                    "branch": get_active_branch(),
+                    "web_port": PORT,
+                    "ssl_enabled": is_ssl_enabled(),
+                    "web_domain": web_cfg.get("WEB_DOMAIN", "")
+                },
+                "system": system_stats
+            })
+            return
+
+        elif path == "/api/peers":
+            peers_data = get_easytier_peers()
+            v_info = get_version_info()
+            latest_v = v_info.get("latest_version", CURRENT_VERSION)
+            active_branch = get_active_branch()
+            node_cfg = load_env_file(CONFIG_FILE)
+            local_ip = (node_cfg.get("IPV4", "") or "").strip()
+            local_hostname = (node_cfg.get("HOSTNAME", "") or "").strip() or "local"
+            local_proto = (node_cfg.get("PROTOCOL", "") or "").strip() or "dual"
+
+            peers_list = []
+            if isinstance(peers_data, list):
+                peers_list = peers_data
+            elif isinstance(peers_data, dict):
+                peers_list = peers_data.get("peers", []) or []
+
+            # Peers reached across a BackPack link show up as plain UDP; name the link's carrier instead.
+            link_transports = {link["peer_ip"]: link["transport"] for link in backpack_links()}
+            remote_hosts = get_easytier_peer_remote_hosts() if link_transports else {}
+
+            for p in peers_list:
+                if isinstance(p, dict) and p.get("ipv4"):
+                    p["is_current"] = bool(local_ip and p.get("ipv4", "").strip() == local_ip)
+                    cost = str(p.get("cost", "")).strip().lower()
+                    p["connection"] = "local" if p["is_current"] or cost == "local" else ("relay" if cost.startswith("relay") else "direct")
+                    over = sorted({link_transports[h] for h in remote_hosts.get(str(p.get("id", "")), ()) if h in link_transports})
+                    if over and p["connection"] == "direct":
+                        p["transport"] = over[0]
+
+            if peers_list:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {
+                        executor.submit(get_peer_version, p.get("ipv4", "")): p
+                        for p in peers_list if isinstance(p, dict) and p.get("ipv4")
+                    }
+                    for fut in concurrent.futures.as_completed(futures):
+                        p = futures[fut]
+                        try:
+                            p_ver = fut.result()
+                        except Exception:
+                            p_ver = "unknown"
+                        p["sutun_version"] = p_ver
+                        peer_cache = PEER_VERSION_CACHE.get(p.get("ipv4", ""), {})
+                        p["interfaces"] = normalize_network_interfaces(peer_cache.get("interfaces"))
+                        p["sutun_branch"] = peer_cache.get("branch", "")
+                        # Peers from 2.2.6-beta.5 on report a channel and can be moved off beta remotely.
+                        tracked = "channel" in peer_cache
+                        on_main = (p["sutun_branch"] or active_branch) == active_branch
+                        if "update_available" in peer_cache and on_main:
+                            # The peer checked main itself.
+                            p["update_available"] = bool(peer_cache.get("update_available"))
+                            p["latest_version"] = peer_cache.get("latest_version", "")
+                            if "update_checked" in peer_cache:
+                                p["update_checked"] = bool(peer_cache.get("update_checked"))
+                        elif p_ver != "unknown" and (on_main or tracked):
+                            # Older peers do not report it, and a peer left on the removed beta channel
+                            # checked beta; an update from here moves it to main, so main's release applies.
+                            p["update_available"] = is_newer_version(latest_v, p_ver)
+                            p["latest_version"] = latest_v
+                        else:
+                            p["update_available"] = False
+                            p["latest_version"] = ""
+                        p["update"] = peer_cache.get("update") or {}
+                        # Reachable peers that do not report a channel run the untracked pre-2.2.6-beta.5 updater.
+                        p["legacy"] = p_ver != "unknown" and not tracked
+                        p["version_drift"] = (p_ver != CURRENT_VERSION)
+
+            # Always include the current node so the Web UI can highlight it,
+            # even when it is alone in the mesh (easytier omits self from peers).
+            if local_ip and not any(isinstance(p, dict) and p.get("ipv4", "").strip() == local_ip for p in peers_list):
+                peers_list = [{
+                    "ipv4": local_ip,
+                    "hostname": local_hostname,
+                    "tunnel_proto": local_proto,
+                    "cost": "Local",
+                    "connection": "local",
+                    "lat_ms": 0,
+                    "rx_bytes": "0 B",
+                    "tx_bytes": "0 B",
+                    "sutun_version": CURRENT_VERSION,
+                    "sutun_branch": active_branch,
+                    "interfaces": get_network_interfaces(),
+                    "version_drift": False,
+                    "is_current": True,
+                }] + peers_list
+            # This server's own entry always reflects its live update job.
+            local_summary = local_update_summary()
+            local_summary["latest_version"] = local_summary["latest_version"] or latest_v
+            local_summary["update_available"] = is_newer_version(local_summary["latest_version"], CURRENT_VERSION)
+            local_summary["update_checked"] = local_summary["update_checked"] or bool(v_info.get("checked"))
+            for p in peers_list:
+                if isinstance(p, dict) and p.get("is_current"):
+                    p.update({
+                        "sutun_version": CURRENT_VERSION,
+                        "sutun_branch": active_branch,
+                        "latest_version": local_summary["latest_version"],
+                        "update_available": local_summary["update_available"],
+                        "update_checked": local_summary["update_checked"],
+                        "update": local_summary["update"],
+                        "version_drift": False,
+                    })
+            if isinstance(peers_data, dict):
+                peers_data["peers"] = peers_list
+            else:
+                # Also covers easytier-cli being unavailable: still show this server.
+                peers_data = peers_list
+
+            has_drift = any(isinstance(p, dict) and p.get("version_drift") for p in peers_list)
+            self.send_json({
+                "ok": True,
+                "data": peers_data,
+                "cluster_version_drift": has_drift,
+                "current_version": CURRENT_VERSION,
+                "latest_version": latest_v,
+                "branch": active_branch,
+                "update_command": v_info.get("update_command", f"bash <(curl -fsSL https://raw.githubusercontent.com/mdjes/SuTun/{active_branch}/sutun.sh) update"),
+                "local_ip": local_ip,
+                "local_hostname": local_hostname
+            })
+            return
+
+        elif path == "/api/routes":
+            routes_data = get_easytier_routes()
+            self.send_json({
+                "ok": True,
+                "data": routes_data
+            })
+            return
+
+        elif path == "/api/tunnels/nodes":
+            local_node, peers = get_tunnel_nodes()
+            nodes = [dict(local_node, is_local=True)]
+            for p in peers:
+                cached = TUNNEL_CACHE.get(p["ip"]) or {}
+                nodes.append({
+                    "ip": p["ip"],
+                    "name": cached.get("name") or p["name"],
+                    "is_local": False,
+                })
+            self.send_json({"ok": True, "local_ip": local_node["ip"], "nodes": nodes})
+            return
+
+        elif path == "/api/tunnels":
+            query_node = (query.get("node") or "").strip()
+            local_node, peers = get_tunnel_nodes()
+
+            if query_node in ("local", "127.0.0.1", local_node["ip"]):
+                self.send_json({
+                    "ok": True,
+                    "data": tag_tunnels(get_tunnels(), local_node["ip"], local_node["name"], is_local=True),
+                    "node": dict(local_node, is_local=True, status="ok", stale=False,
+                                 fetched_at=time.time(), latency_ms=0),
+                })
+                return
+
+            if query_node:
+                peer = next((p for p in peers if p["ip"] == query_node), None)
+                if peer is None and query_node not in TUNNEL_CACHE:
+                    self.send_json({"ok": False, "error": "Unknown mesh node", "code": "unknown_node"}, status=404)
+                    return
+                peer = peer or {"ip": query_node, "name": TUNNEL_CACHE[query_node].get("name") or query_node}
+                data, node = fetch_remote_tunnels(peer)
+                self.send_json({"ok": True, "data": data, "node": node})
+                return
+
+            # Legacy aggregate view: every node, bounded by one overall deadline.
+            local_tunnels = dict(get_tunnels())
+            local_tunnels.update(tag_tunnels(local_tunnels, local_node["ip"], local_node["name"], is_local=True))
+            node_states = [dict(local_node, is_local=True, status="ok", stale=False)]
+            if peers:
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+                futures = {executor.submit(fetch_remote_tunnels, p): p for p in peers}
+                done, _ = concurrent.futures.wait(futures, timeout=TUNNEL_FETCH_DEADLINE)
+                for fut, p in futures.items():
+                    if fut in done:
+                        data, node = fut.result()
+                    else:
+                        data, node = tunnel_cache_fallback(p, "timeout", "Node did not answer in time")
+                    node_states.append(node)
+                    for t_type in TUNNEL_TYPES:
+                        local_tunnels.setdefault(t_type, []).extend(data.get(t_type, []))
+                executor.shutdown(wait=False)
+
+            self.send_json({"ok": True, "data": local_tunnels, "nodes": node_states})
+            return
+
+        elif path == "/api/interfaces":
+            query_node = (query.get("node") or "").strip()
+            cfg = load_env_file(CONFIG_FILE)
+            local_ip = cfg.get("IPV4", "127.0.0.1")
+
+            if query_node and query_node not in ("local", "127.0.0.1", local_ip):
+                secret = cfg.get("NETWORK_SECRET", "").strip()
+                remote_ifaces, warning = get_remote_network_interfaces(query_node, secret)
+                if remote_ifaces:
+                    response = {
+                        "ok": True,
+                        "data": remote_ifaces,
+                        "node": query_node,
+                    }
+                    if warning:
+                        response["warning"] = warning
+                    self.send_json(response)
+                    return
+
+                self.send_json({
+                    "ok": False,
+                    "error": warning or "Could not load interfaces from remote node.",
+                    "node": query_node,
+                }, status=502)
+                return
+
+            ifaces = get_network_interfaces()
+            self.send_json({
+                "ok": True,
+                "data": ifaces
+            })
+            return
+
+        elif path == "/api/live/status":
+            snapshot = live_test_snapshot(query.get("id", ""))
+            if snapshot:
+                self.send_json({"ok": True, "job": snapshot})
+            else:
+                self.send_json({"ok": False, "error": "This test is no longer available."}, status=404)
+            return
+
+        elif path == "/api/cluster/status":
+            now = time.time()
+            rem = max(0.0, ROLLBACK_EXPIRY - now) if ROLLBACK_EXPIRY > now else 0.0
+            self.send_json({
+                "ok": True,
+                "watchdog_armed": rem > 0,
+                "watchdog_remaining_sec": round(rem, 1),
+                "backup_exists": os.path.isfile(CONFIG_BACKUP_FILE),
+                "staged_exists": os.path.isfile(CONFIG_STAGED_FILE),
+                "last_rollback": LAST_ROLLBACK
+            })
+            return
+
+        elif path == "/api/node/config":
+            config = load_env_file(CONFIG_FILE)
+            peers_raw = config.get("PEERS", "")
+            peers_list = [p.strip() for p in peers_raw.split(",") if p.strip()] if peers_raw else []
+
+            svc_active = False
+            try:
+                r = subprocess.run(["systemctl", "is-active", "--quiet", "sutun.service"], timeout=3)
+                svc_active = (r.returncode == 0)
+            except Exception:
+                pass
+
+            hostname_val = config.get("HOSTNAME", "")
+            if not hostname_val and hasattr(os, "uname"):
+                hostname_val = os.uname().nodename
+
+            web_cfg = load_env_file(WEB_ENV_FILE)
+            is_node_configured = os.path.isfile(CONFIG_FILE) and bool(config.get("IPV4"))
+            self.send_json({
+                "ok": True,
+                "data": {
+                    "network_name": config.get("NETWORK_NAME", "sutun"),
+                    "network_secret": config.get("NETWORK_SECRET", ""),
+                    "hostname": hostname_val or "node",
+                    "ipv4": config.get("IPV4", "10.144.144.1"),
+                    "protocol": config.get("PROTOCOL", "dual"),
+                    "port": int(config.get("PORT", "11010")),
+                    "peers": peers_list,
+                    "encryption": config.get("ENCRYPTION", "yes") == "yes",
+                    "ipv6": config.get("IPV6", "no") == "yes",
+                    "mtu": int(config.get("MTU", "1380")),
+                    "enable_kcp": config.get("ENABLE_KCP", "no") == "yes",
+                    "multi_thread": config.get("MULTI_THREAD", "no") == "yes",
+                    "public_ip": get_server_public_ip(),
+                    "node_configured": is_node_configured,
+                    "service_active": svc_active,
+                    "last_rollback": LAST_ROLLBACK,
+                    "sutun_version": CURRENT_VERSION,
+                    "branch": get_active_branch(),
+                    "web_port": PORT,
+                    "ssl_enabled": is_ssl_enabled(),
+                    "web_domain": web_cfg.get("WEB_DOMAIN", "")
+                }
+            })
+            return
+
+        elif path == "/api/node/invite":
+            config = load_env_file(CONFIG_FILE)
+            if not os.path.isfile(CONFIG_FILE):
+                self.send_json({"ok": False, "error": "Node is not configured yet."}, status=400)
+                return
+
+            pub_ip = get_server_public_ip()
+            port = parse_port(config.get("PORT", "11010")) or 11010
+            proto = config.get("PROTOCOL", "dual")
+            try:
+                mtu = int(config.get("MTU", "1380"))
+            except ValueError:
+                mtu = 1380
+            ipv6_on = config.get("IPV6", "no") == "yes"
+
+            invite_obj = {
+                "v": 2,
+                "net": config.get("NETWORK_NAME", "sutun"),
+                "secret": config.get("NETWORK_SECRET", ""),
+                "endpoint": f"{pub_ip}:{port}" if pub_ip else "",
+                "proto": proto,
+                # Everything a joining node needs to match this mesh: transport settings and the mesh port.
+                "port": port,
+                "enc": config.get("ENCRYPTION", "yes") != "no",
+                "kcp": config.get("ENABLE_KCP", "no") == "yes",
+                "ipv6": ipv6_on,
+                "mtu": mtu
+            }
+
+            # Other servers may dial this one over IPv6 when it is enabled and reachable.
+            # EasyTier adds [::] listeners except for FakeTCP, and BackPack links are IPv4-only.
+            pub_ipv6 = ""
+            ipv6_unavailable = ""
+            if not ipv6_on:
+                ipv6_unavailable = "disabled"
+            elif proto in BACKPACK_CARRIERS:
+                ipv6_unavailable = proto
+            elif proto == "faketcp":
+                ipv6_unavailable = "faketcp"
+            else:
+                pub_ipv6 = get_server_public_ipv6()
+                if not pub_ipv6:
+                    ipv6_unavailable = "not_detected"
+            if proto in BACKPACK_CARRIERS:
+                name = proto.upper()
+                # A server that joined over a link is not where codes come from; creating one here
+                # would leave an extra BackPack listener running, so it takes an explicit request.
+                joined_via = joined_via_link(backpack_links(), config.get("PEERS", ""))
+                if joined_via and query.get("here") != "1":
+                    self.send_json({"ok": True, "data": {"joined_via": joined_via, "proto": proto}})
+                    return
+                if not pub_ip:
+                    self.send_json({"ok": False, "error": f"This server's public IP is unknown, so no {name} link can be offered."}, status=500)
+                    return
+                mismatch = cli_version_mismatch_error()
+                if mismatch:
+                    self.send_json({"ok": False, "error": mismatch}, status=500)
+                    return
+                # Each ICMP/PCK invite carries one link; it is reused until a server actually joins on it.
+                cmd = ["icmp-invite"] if proto == "icmp" else ["link-invite", BACKPACK_CARRIERS[proto]]
+                ok, out = run_sutun_cmd(cmd, timeout=120)
+                link = last_json_line(out) if ok else None
+                if not link:
+                    self.send_json({"ok": False, "error": out or f"Could not prepare a {name} link for this invite."}, status=500)
+                    return
+                invite_obj[invite_link_key(proto)] = link
+                invite_obj["mtu"] = min(mtu, ICMP_MESH_MTU)
+            token_str = base64.b64encode(json.dumps(invite_obj).encode("utf-8")).decode("utf-8")
+            self.send_json({
+                "ok": True,
+                "data": {
+                    "invite": f"xrmesh://{token_str}",
+                    "details": invite_obj,
+                    "public_ip": pub_ip,
+                    "public_ipv6": pub_ipv6,
+                    "endpoint_ipv6": f"[{pub_ipv6}]:{port}" if pub_ipv6 else "",
+                    "ipv6_unavailable": ipv6_unavailable,
+                    "port": port
+                }
+            })
+            return
+
+        self.send_error(404, "Endpoint not found")
+
+    def handle_post(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+
+        # Read JSON body
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = b"{}"
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+
+        data = {}
+        try:
+            data = json.loads(body.decode("utf-8")) if body else {}
+        except Exception:
+            pass
+        if not isinstance(data, dict):
+            data = {}
+
+        # Public Auth Endpoints
+        if path == "/api/auth/login":
+            client_ip = self.client_address[0]
+            allowed, retry_after = check_login_rate_limit(client_ip)
+            if not allowed:
+                self.send_json({
+                    "ok": False,
+                    "error": f"Too many failed login attempts. Please wait {retry_after} seconds."
+                }, status=429, headers={"Retry-After": str(retry_after)})
+                return
+
+            password = data.get("password", "")
+            token = data.get("token", "")
+
+            web_cfg = load_env_file(WEB_ENV_FILE)
+            stored_hash = web_cfg.get("WEB_PASSWORD_HASH", "")
+
+            # 1. Try Token
+            if token and validate_token(token):
+                reset_login_attempts(client_ip)
+                session_id = create_session()
+                cookie_val = get_session_cookie(session_id)
+                self.send_json({"ok": True, "method": "token"}, headers={"Set-Cookie": cookie_val})
+                return
+
+            # 2. Try Password
+            if password and stored_hash and verify_password(password, stored_hash):
+                reset_login_attempts(client_ip)
+                session_id = create_session()
+                cookie_val = get_session_cookie(session_id)
+                self.send_json({"ok": True, "method": "password"}, headers={"Set-Cookie": cookie_val})
+                return
+
+            record_failed_login(client_ip)
+            self.send_json({"ok": False, "error": "Invalid password or access token"}, status=401)
+            return
+
+        elif path == "/api/auth/logout":
+            cookie_header = self.headers.get("Cookie", "")
+            if cookie_header:
+                for item in cookie_header.split(";"):
+                    if item.strip().startswith(f"{SESSION_COOKIE_NAME}="):
+                        sid = item.strip().split("=", 1)[1]
+                        if sid in SESSIONS:
+                            del SESSIONS[sid]
+            secure_flag = "; Secure" if is_ssl_enabled() else ""
+            clear_cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure_flag}"
+            self.send_json({"ok": True}, headers={"Set-Cookie": clear_cookie})
+            return
+
+        # ======================================================================
+        # 🌐 Cluster Inter-Node SafeSync Endpoints (Authenticated via HMAC-SHA256)
+        # ======================================================================
+        if path in (
+            "/api/cluster/prepare", "/api/cluster/commit", "/api/cluster/confirm", "/api/cluster/rollback",
+            "/api/cluster/tunnels", "/api/cluster/tunnel/create", "/api/cluster/tunnel/edit", "/api/cluster/tunnel/delete",
+            "/api/cluster/node/update", "/api/cluster/node/update-status",
+            "/api/cluster/interfaces", "/api/cluster/iperf/run", "/api/cluster/ping/run",
+            "/api/cluster/iperf/start", "/api/cluster/ping/start", "/api/cluster/live/status"
+        ):
+            valid, err_msg = verify_cluster_hmac(self.headers, body)
+            if not valid:
+                self.send_json({"ok": False, "error": f"Cluster authentication failed: {err_msg}"}, status=403)
+                return
+
+            if path == "/api/cluster/prepare":
+                if icmp_protocol_switch(load_env_file(CONFIG_FILE).get("PROTOCOL", "dual"), data.get("PROTOCOL", "")):
+                    self.send_json({"ok": False, "error": ICMP_SAFESYNC_ERROR}, status=400)
+                    return
+                try:
+                    shutil.copy2(CONFIG_FILE, CONFIG_BACKUP_FILE)
+                except Exception as e:
+                    self.send_json({"ok": False, "error": f"Failed to create config backup: {e}"}, status=500)
+                    return
+
+                lines = []
+                for k in ALLOWED_CLUSTER_KEYS:
+                    if k in data and data[k] != "":
+                        v = str(data[k]).replace("'", "'\\''")
+                        lines.append(f"{k}='{v}'\n")
+
+                with open(CONFIG_STAGED_FILE, "w", encoding="utf-8") as f:
+                    f.writelines(lines)
+                try:
+                    os.chmod(CONFIG_STAGED_FILE, 0o600)
+                except Exception:
+                    pass
+
+                cur_cfg = load_env_file(CONFIG_FILE)
+                self.send_json({
+                    "ok": True,
+                    "status": "prepared",
+                    "node": cur_cfg.get("HOSTNAME", "node"),
+                    "staged_keys": [k for k in ALLOWED_CLUSTER_KEYS if k in data]
+                })
+                return
+
+            elif path == "/api/cluster/commit":
+                ok, msg = apply_staged_cluster_config()
+                cur_cfg = load_env_file(CONFIG_FILE)
+                if ok:
+                    self.send_json({
+                        "ok": True,
+                        "status": "committed",
+                        "node": cur_cfg.get("HOSTNAME", "node"),
+                        "message": msg
+                    })
+                else:
+                    self.send_json({"ok": False, "error": msg}, status=500)
+                return
+
+            elif path == "/api/cluster/confirm":
+                disarm_rollback_watchdog()
+                cur_cfg = load_env_file(CONFIG_FILE)
+                self.send_json({
+                    "ok": True,
+                    "status": "confirmed_safe",
+                    "node": cur_cfg.get("HOSTNAME", "node")
+                })
+                return
+
+            elif path == "/api/cluster/rollback":
+                ok = rollback_cluster_config()
+                cur_cfg = load_env_file(CONFIG_FILE)
+                if ok:
+                    self.send_json({
+                        "ok": True,
+                        "status": "rolled_back",
+                        "node": cur_cfg.get("HOSTNAME", "node")
+                    })
+                else:
+                    self.send_json({"ok": False, "error": "No backup file found or rollback failed."}, status=500)
+                return
+
+            elif path == "/api/cluster/tunnels":
+                cur_cfg = load_env_file(CONFIG_FILE)
+                tunnels = get_tunnels()
+                self.send_json({
+                    "ok": True,
+                    "node_ip": cur_cfg.get("IPV4", ""),
+                    "node_name": cur_cfg.get("HOSTNAME", "node"),
+                    "tunnels": tunnels
+                })
+                return
+
+            elif path in ("/api/cluster/tunnel/create", "/api/cluster/tunnel/edit", "/api/cluster/tunnel/delete"):
+                action = path.rsplit("/", 1)[1]
+                ok, msg = run_tunnel_command(tunnel_field(data, "tunnel_type").lower(), action, data)
+                if ok:
+                    self.send_json({"ok": True, "message": msg})
+                else:
+                    self.send_json({"ok": False, "error": msg}, status=400)
+                return
+
+            elif path == "/api/cluster/node/update":
+                ok, msg, code = spawn_detached_node_update()
+                cur_cfg = load_env_file(CONFIG_FILE)
+                self.send_json({
+                    "ok": ok,
+                    "code": code,
+                    "message": f"Update initiated on node '{cur_cfg.get('HOSTNAME', 'node')}': {msg}",
+                    "error": "" if ok else msg,
+                    "node": cur_cfg.get("HOSTNAME", "node"),
+                    "status": local_update_summary(),
+                })
+                return
+
+            elif path == "/api/cluster/node/update-status":
+                self.send_json({"ok": True, "status": local_update_summary()})
+                return
+
+            elif path == "/api/cluster/interfaces":
+                cur_cfg = load_env_file(CONFIG_FILE)
+                ifaces = get_network_interfaces()
+                self.send_json({
+                    "ok": True,
+                    "node_ip": cur_cfg.get("IPV4", ""),
+                    "node_name": cur_cfg.get("HOSTNAME", "node"),
+                    "interfaces": ifaces
+                })
+                return
+
+            elif path == "/api/cluster/iperf/run":
+                target = data.get("target", "").strip()
+                protocol = data.get("protocol", "tcp").lower()
+                duration = min(max(int(data.get("duration", 5)), 1), 30)
+                bandwidth = data.get("bandwidth", "50M").strip()
+                port = int(data.get("port", 5201))
+
+                cur_cfg = load_env_file(CONFIG_FILE)
+                local_ip = cur_cfg.get("IPV4", "")
+                ok, res, status = execute_iperf_benchmark(target, protocol, duration, bandwidth, port, source_ip=local_ip)
+                if ok:
+                    self.send_json({"ok": True, "data": res})
+                else:
+                    self.send_json({"ok": False, "error": res}, status=status)
+                return
+
+            elif path == "/api/cluster/ping/run":
+                target = data.get("target", "").strip()
+                count = min(max(int(data.get("count", 4)), 1), 10)
+                cur_cfg = load_env_file(CONFIG_FILE)
+                local_ip = cur_cfg.get("IPV4", "")
+                ok, res, status = execute_ping_benchmark(target, count=count, source_ip=local_ip)
+                if ok:
+                    self.send_json({"ok": True, "data": res})
+                else:
+                    self.send_json({"ok": False, "error": res}, status=status)
+                return
+
+            elif path in ("/api/cluster/ping/start", "/api/cluster/iperf/start"):
+                kind = "ping" if path == "/api/cluster/ping/start" else "iperf"
+                # The requesting node already chose this node as the runner.
+                data = dict(data, source="")
+                params, err = parse_ping_request(data) if kind == "ping" else parse_iperf_request(data)
+                if not params:
+                    self.send_json({"ok": False, "error": err}, status=400)
+                    return
+                local_ip = load_env_file(CONFIG_FILE).get("IPV4", "")
+                job, err, status = start_live_test(kind, params, local_ip)
+                if job:
+                    self.send_json({"ok": True, "job_id": job["id"]})
+                else:
+                    self.send_json({"ok": False, "error": err}, status=status)
+                return
+
+            elif path == "/api/cluster/live/status":
+                snapshot = live_test_snapshot(str(data.get("job_id", "")))
+                if snapshot:
+                    self.send_json({"ok": True, "job": snapshot})
+                else:
+                    self.send_json({"ok": False, "error": "Live test not found"}, status=410)
+                return
+
+        # Authenticated Endpoints
+        auth_ok, _ = is_authenticated(self.headers)
+        if not auth_ok:
+            self.send_json({"error": "Unauthorized", "authenticated": False}, status=401)
+            return
+
+        # Ensure mesh node is configured before allowing operational endpoints
+        if path.startswith(("/api/tunnels/", "/api/ping", "/api/speedtest", "/api/iperf")):
+            node_cfg = load_env_file(CONFIG_FILE)
+            if not os.path.isfile(CONFIG_FILE) or not node_cfg.get("IPV4"):
+                self.send_json({"ok": False, "error": "Mesh node is not configured yet. Please complete node setup first."}, status=400)
+                return
+
+        if path in ("/api/ping/start", "/api/iperf/start"):
+            kind = "ping" if path == "/api/ping/start" else "iperf"
+            params, err = parse_ping_request(data) if kind == "ping" else parse_iperf_request(data)
+            if not params:
+                self.send_json({"ok": False, "error": err}, status=400)
+                return
+            cfg = load_env_file(CONFIG_FILE)
+            job, err, status = start_live_test(
+                kind, params, cfg.get("IPV4", "").strip(), cfg.get("NETWORK_SECRET", "").strip()
+            )
+            if job:
+                self.send_json({"ok": True, "job_id": job["id"]})
+            else:
+                self.send_json({"ok": False, "error": err}, status=status)
+            return
+
+        if path == "/api/ping":
+            target = data.get("target", "").strip()
+            source = data.get("source", "").strip()
+            count = min(max(int(data.get("count", 4)), 1), 10)
+
+            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", target):
+                self.send_json({"ok": False, "error": "Invalid target IP"}, status=400)
+                return
+
+            cfg = load_env_file(CONFIG_FILE)
+            local_ip = cfg.get("IPV4", "").strip()
+
+            if source and target == source:
+                self.send_json({"ok": False, "error": "Source and target cannot be the same node"}, status=400)
+                return
+
+            # If source is remote node, forward via HMAC-signed cluster request
+            if source and source not in ("local", "127.0.0.1", local_ip):
+                secret = cfg.get("NETWORK_SECRET", "").strip()
+                if not secret:
+                    self.send_json({"ok": False, "error": "Cluster secret not configured on this node"}, status=500)
+                    return
+                cached_peer = PEER_VERSION_CACHE.get(source, {})
+                peer_port = cached_peer.get("port", PORT)
+                payload = {
+                    "target": target,
+                    "count": count
+                }
+                timeout = count * 2 + 10
+                ok, res = send_cluster_http(source, peer_port, "/api/cluster/ping/run", secret, payload, timeout=timeout)
+                if ok and isinstance(res, dict) and res.get("ok"):
+                    ping_data = res.get("data", {})
+                    ping_data["source"] = source
+                    ping_data["target"] = target
+                    self.send_json({"ok": True, "data": ping_data})
+                else:
+                    err = res.get("error") if isinstance(res, dict) else str(res)
+                    self.send_json({"ok": False, "error": f"Remote node {source} error: {err}"}, status=400)
+                return
+
+            # Otherwise execute locally
+            ok, res, status = execute_ping_benchmark(target, count=count, source_ip=local_ip)
+            if ok:
+                self.send_json({"ok": True, "data": res})
+            else:
+                self.send_json({"ok": False, "error": res}, status=status)
+            return
+
+        elif path == "/api/iperf/run":
+            target = data.get("target", "").strip()
+            source = data.get("source", "").strip()
+            protocol = data.get("protocol", "tcp").lower()
+            duration = min(max(int(data.get("duration", 5)), 1), 30)
+            bandwidth = data.get("bandwidth", "50M").strip()
+            port = int(data.get("port", 5201))
+
+            if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", target):
+                self.send_json({"ok": False, "error": "Invalid target IP"}, status=400)
+                return
+
+            cfg = load_env_file(CONFIG_FILE)
+            local_ip = cfg.get("IPV4", "").strip()
+
+            if source and target == source:
+                self.send_json({"ok": False, "error": "Source and target cannot be the same node"}, status=400)
+                return
+
+            # If source is remote node, forward via HMAC-signed cluster request
+            if source and source not in ("local", "127.0.0.1", local_ip):
+                secret = cfg.get("NETWORK_SECRET", "").strip()
+                if not secret:
+                    self.send_json({"ok": False, "error": "Cluster secret not configured on this node"}, status=500)
+                    return
+                cached_peer = PEER_VERSION_CACHE.get(source, {})
+                peer_port = cached_peer.get("port", PORT)
+                payload = {
+                    "target": target,
+                    "protocol": protocol,
+                    "duration": duration,
+                    "bandwidth": bandwidth,
+                    "port": port
+                }
+                timeout = duration + 15
+                ok, res = send_cluster_http(source, peer_port, "/api/cluster/iperf/run", secret, payload, timeout=timeout)
+                if ok and isinstance(res, dict) and res.get("ok"):
+                    bench_data = res.get("data", {})
+                    bench_data["source"] = source
+                    bench_data["target"] = target
+                    self.send_json({"ok": True, "data": bench_data})
+                else:
+                    err = res.get("error") if isinstance(res, dict) else str(res)
+                    self.send_json({"ok": False, "error": f"Remote node {source} error: {err}"}, status=400)
+                return
+
+            # Otherwise execute locally
+            ok, res, status = execute_iperf_benchmark(target, protocol, duration, bandwidth, port, source_ip=local_ip)
+            if ok:
+                self.send_json({"ok": True, "data": res})
+            else:
+                self.send_json({"ok": False, "error": res}, status=status)
+            return
+
+        elif TUNNEL_ACTION_RE.match(path):
+            t_type, action = TUNNEL_ACTION_RE.match(path).groups()
+            origin_node = tunnel_field(data, "origin_node")
+            if is_local_origin(origin_node):
+                ok, msg = run_tunnel_command(t_type, action, data)
+                status = 200 if ok else 400
+            elif t_type == "iptables" and action != "delete":
+                ok, status = False, 400
+                msg = "iptables tunnels can only be configured locally on the host server. Please manage iptables tunnels directly from that node's web panel."
+            else:
+                ok, msg, status = proxy_tunnel_request(origin_node, t_type, action, data)
+            if ok:
+                self.send_json({"ok": True, "message": msg})
+            else:
+                self.send_json({"ok": False, "error": msg}, status=status)
+            return
+
+        elif path == "/api/node/config":
+            net_name = str(data.get("network_name") or "").strip()
+            secret = str(data.get("network_secret") or "").strip()
+            hostname = str(data.get("hostname") or "").strip()
+            ipv4 = str(data.get("ipv4") or "").strip()
+            port = parse_port(data.get("port", 11010))
+            protocol = str(data.get("protocol") or "dual").strip().lower()
+            peers = data.get("peers", [])
+            encryption = "yes" if data.get("encryption", True) else "no"
+            ipv6 = "yes" if data.get("ipv6", False) else "no"
+            mtu = parse_mtu(data.get("mtu", 1360))
+            enable_kcp = "yes" if data.get("enable_kcp", False) else "no"
+            multi_thread = "yes" if data.get("multi_thread", True) else "no"
+
+            if not net_name or not secret or not ipv4 or not hostname:
+                self.send_json({"ok": False, "error": "Missing required fields: network_name, network_secret, ipv4, port, hostname"}, status=400)
+                return
+            if has_control_chars(net_name) or has_control_chars(secret):
+                self.send_json({"ok": False, "error": "Network name and secret cannot contain line breaks or control characters."}, status=400)
+                return
+            if not valid_mesh_hostname(hostname):
+                self.send_json({"ok": False, "error": "Server name must start with a letter or number and may only contain letters, numbers, '.', '-' or '_'."}, status=400)
+                return
+            if not valid_ipv4(ipv4):
+                self.send_json({"ok": False, "error": "Enter a valid virtual IPv4 address."}, status=400)
+                return
+            if port is None:
+                self.send_json({"ok": False, "error": "Listen port must be between 1 and 65535."}, status=400)
+                return
+            if protocol not in MESH_PROTOCOLS:
+                self.send_json({"ok": False, "error": f"Unknown protocol '{protocol}'. Use one of: {', '.join(MESH_PROTOCOLS)}."}, status=400)
+                return
+            if mtu is None:
+                self.send_json({"ok": False, "error": "MTU must be between 576 and 9000."}, status=400)
+                return
+
+            if isinstance(peers, list):
+                raw_peers = [str(p).strip() for p in peers if str(p).strip()]
+            else:
+                raw_peers = [p.strip() for p in str(peers).split(",") if p.strip()]
+            clean_peers = [sanitize_peer_endpoint(p, str(port)) for p in raw_peers]
+            peers_str = ",".join(p for p in clean_peers if p)
+
+            previous_raw = None
+            if os.path.isfile(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "rb") as f:
+                        previous_raw = f.read()
+                except OSError as e:
+                    self.send_json({"ok": False, "error": f"Could not back up the current configuration: {e}"}, status=500)
+                    return
+
+            save_node_config_env({
+                "NETWORK_NAME": net_name,
+                "NETWORK_SECRET": secret,
+                "HOSTNAME": hostname,
+                "IPV4": ipv4,
+                "PROTOCOL": protocol,
+                "PORT": str(port),
+                "PEERS": peers_str,
+                "ENCRYPTION": encryption,
+                "IPV6": ipv6,
+                "MTU": str(mtu),
+                "ENABLE_KCP": enable_kcp,
+                "MULTI_THREAD": multi_thread
+            })
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if ok:
+                self.send_json({"ok": True, "message": "Node configuration saved and mesh service is online."})
+            else:
+                # Put the last working configuration back so a bad setting cannot leave the node offline.
+                if previous_raw is not None:
+                    write_config_bytes(previous_raw)
+                    run_sutun_cmd(["node-restart"])
+                else:
+                    run_sutun_cmd(["delete-node"])
+                self.send_json({
+                    "ok": False,
+                    "restored": previous_raw is not None,
+                    "error": f"The mesh service failed to start with these settings, so the previous configuration was restored: {msg}"
+                    if previous_raw is not None else f"The mesh service failed to start with these settings: {msg}"
+                }, status=500)
+            return
+
+        elif path == "/api/node/peers/add":
+            new_peer_raw = data.get("peer", "").strip()
+            if not new_peer_raw:
+                self.send_json({"ok": False, "error": "Missing peer address"}, status=400)
+                return
+
+            cfg = load_env_file(CONFIG_FILE)
+            mesh_port = cfg.get("PORT", "11010")
+            new_peer = sanitize_peer_endpoint(new_peer_raw, mesh_port)
+            if not new_peer:
+                self.send_json({"ok": False, "error": "Invalid peer address format"}, status=400)
+                return
+
+            cur_peers = [sanitize_peer_endpoint(p, mesh_port) for p in cfg.get("PEERS", "").split(",") if p.strip()]
+            cur_peers = [p for p in cur_peers if p]
+            if new_peer not in cur_peers:
+                cur_peers.append(new_peer)
+            cfg["PEERS"] = ",".join(cur_peers)
+            save_node_config_env(cfg)
+
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if ok:
+                self.send_json({"ok": True, "message": f"Peer '{new_peer}' added and mesh service restarted.", "peers": cur_peers})
+            else:
+                self.send_json({"ok": False, "error": f"Peer added, but service reload failed: {msg}"}, status=500)
+            return
+
+        elif path == "/api/node/peers/remove":
+            peer_to_remove = data.get("peer", "").strip()
+            if not peer_to_remove:
+                self.send_json({"ok": False, "error": "Missing peer address"}, status=400)
+                return
+
+            cfg = load_env_file(CONFIG_FILE)
+            mesh_port = cfg.get("PORT", "11010")
+            clean_remove = sanitize_peer_endpoint(peer_to_remove, mesh_port) or peer_to_remove
+            cur_peers = [p.strip() for p in cfg.get("PEERS", "").split(",") if p.strip()]
+            cur_peers = [p for p in cur_peers if p != peer_to_remove and p != clean_remove]
+            cfg["PEERS"] = ",".join(cur_peers)
+            save_node_config_env(cfg)
+
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if ok:
+                self.send_json({"ok": True, "message": f"Peer '{peer_to_remove}' removed.", "peers": cur_peers})
+            else:
+                self.send_json({"ok": False, "error": f"Peer removed, but service reload failed: {msg}"}, status=500)
+            return
+
+        elif path == "/api/node/join":
+            # Joining replaces the whole mesh configuration (the UI confirms this first).
+            # Only this server's name and listen port carry over; tunnels are untouched.
+            try:
+                invite = decode_invite_token(data.get("invite", ""))
+            except InviteTokenError as e:
+                self.send_json({"ok": False, "code": e.code, "error": str(e)}, status=400)
+                return
+
+            current = load_env_file(CONFIG_FILE)
+            hostname = str(data.get("hostname") or current.get("HOSTNAME") or "").strip()
+            if not hostname and hasattr(os, "uname"):
+                hostname = os.uname().nodename
+            if not valid_mesh_hostname(hostname):
+                self.send_json({
+                    "ok": False,
+                    "code": "invalid_hostname",
+                    "error": "Server name must start with a letter or number and may only contain letters, numbers, '.', '-' or '_'."
+                }, status=400)
+                return
+
+            ipv4 = str(data.get("ipv4") or "").strip() or f"10.144.144.{secrets.randbelow(253) + 2}"
+            if not valid_ipv4(ipv4):
+                self.send_json({"ok": False, "code": "invalid_ipv4", "error": "Enter a valid virtual IPv4 address."}, status=400)
+                return
+
+            # The invite carries the mesh port, so a joining server uses the same one unless told otherwise.
+            port = parse_port(data.get("port") or invite.get("port") or current.get("PORT") or 11010)
+            if port is None:
+                self.send_json({"ok": False, "code": "invalid_port", "error": "Listen port must be between 1 and 65535."}, status=400)
+                return
+
+            previous_raw = None
+            if os.path.isfile(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "rb") as f:
+                        previous_raw = f.read()
+                except OSError as e:
+                    self.send_json({"ok": False, "code": "backup_failed", "error": f"Could not back up the current configuration: {e}"}, status=500)
+                    return
+
+            peer = invite["endpoint"]
+            mtu = invite.get("mtu", 1380)
+            icmp_link_name = None
+            if invite["proto"] in BACKPACK_CARRIERS:
+                # EasyTier reaches the inviting server through the BackPack link, not its public address.
+                mismatch = cli_version_mismatch_error()
+                if mismatch:
+                    self.send_json({"ok": False, "code": "icmp_link_failed", "error": mismatch}, status=500)
+                    return
+                host, mesh_port = split_endpoint(invite["endpoint"])
+                link = invite["icmp"]
+                join_cmd = ["icmp-join", host, str(link["p"]), link["t"], str(link["i"])]
+                if invite["proto"] != "icmp":
+                    join_cmd = ["link-join", *join_cmd[1:], BACKPACK_CARRIERS[invite["proto"]]]
+                ok, out = run_sutun_cmd(join_cmd, timeout=120)
+                created = last_json_line(out) if ok else None
+                if not created or not valid_ipv4(str(created.get("peer_ip", ""))):
+                    self.send_json({
+                        "ok": False,
+                        "code": "icmp_link_failed",
+                        "error": out or f"The {invite['proto'].upper()} link could not be created."
+                    }, status=500)
+                    return
+                icmp_link_name = created.get("name")
+                peer = f"udp://{created['peer_ip']}:{mesh_port}"
+                mtu = min(mtu, ICMP_MESH_MTU)
+
+            # A pending SafeSync watchdog would otherwise roll this server back to the old mesh.
+            disarm_rollback_watchdog()
+            save_node_config_env({
+                "NETWORK_NAME": invite["net"],
+                "NETWORK_SECRET": invite["secret"],
+                "HOSTNAME": hostname,
+                "IPV4": ipv4,
+                "PROTOCOL": invite["proto"],
+                "PORT": str(port),
+                "PEERS": peer,
+                "ENCRYPTION": "yes" if invite.get("enc", True) else "no",
+                # Dialling an IPv6 endpoint needs IPv6 enabled on this side too.
+                "IPV6": "yes" if invite.get("ipv6", False) or ":" in (split_endpoint(invite["endpoint"]) or ("",))[0] else "no",
+                "MTU": str(mtu),
+                "ENABLE_KCP": "yes" if invite.get("kcp", False) else "no",
+                # Multi-thread is this server's own setting, so it survives joining another mesh.
+                "MULTI_THREAD": ("yes" if current.get("MULTI_THREAD") == "yes" else "no") if previous_raw is not None else "yes",
+            })
+
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if not ok:
+                if icmp_link_name:
+                    run_sutun_cmd(["icmp-delete", icmp_link_name])
+                if previous_raw is not None:
+                    write_config_bytes(previous_raw)
+                    run_sutun_cmd(["node-restart"])
+                else:
+                    run_sutun_cmd(["delete-node"])
+                self.send_json({
+                    "ok": False,
+                    "code": "start_failed",
+                    "restored": True,
+                    "error": msg or "The mesh service failed to start with the new configuration."
+                }, status=500)
+                return
+
+            # ICMP/PCK links that only served the previous mesh's peers are no longer needed.
+            if os.path.isdir(ICMP_LINK_DIR):
+                run_sutun_cmd(["icmp-prune"])
+
+            # SafeSync backup/staged files and rollback notices belong to the previous mesh.
+            for stale in (CONFIG_BACKUP_FILE, CONFIG_STAGED_FILE):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            LAST_ROLLBACK["occurred"] = False
+
+            self.send_json({
+                "ok": True,
+                "message": f"Joined mesh '{invite['net']}'. The previous configuration was replaced.",
+                "data": {
+                    "network_name": invite["net"],
+                    "hostname": hostname,
+                    "ipv4": ipv4,
+                    "port": port,
+                    "peer": sanitize_peer_endpoint(invite["endpoint"], str(port))
+                }
+            })
+            return
+
+        elif path == "/api/cluster/broadcast":
+            cfg = load_env_file(CONFIG_FILE)
+            current_secret = cfg.get("NETWORK_SECRET", "").strip()
+            if not current_secret:
+                self.send_json({"ok": False, "error": "Current node has no network secret configured."}, status=400)
+                return
+
+            new_protocol = data.get("protocol", cfg.get("PROTOCOL", "dual")).strip().lower()
+            if icmp_protocol_switch(cfg.get("PROTOCOL", "dual"), new_protocol):
+                self.send_json({"ok": False, "error": ICMP_SAFESYNC_ERROR}, status=400)
+                return
+            new_kcp = "yes" if data.get("enable_kcp", cfg.get("ENABLE_KCP") == "yes") else "no"
+            new_encryption = "yes" if data.get("encryption", cfg.get("ENCRYPTION") != "no") else "no"
+            new_ipv6 = "yes" if data.get("ipv6", cfg.get("IPV6") == "yes") else "no"
+            new_mtu = str(data.get("mtu", cfg.get("MTU", "1380"))).strip()
+            new_secret = data.get("network_secret", current_secret).strip()
+
+            staged_payload = {
+                "PROTOCOL": new_protocol,
+                "ENABLE_KCP": new_kcp,
+                "ENCRYPTION": new_encryption,
+                "IPV6": new_ipv6,
+                "MTU": new_mtu,
+                "NETWORK_SECRET": new_secret,
+                "NETWORK_NAME": cfg.get("NETWORK_NAME", "sutun")
+            }
+
+            # Find active peer nodes in the mesh
+            peers_raw = get_easytier_peers() or []
+            if isinstance(peers_raw, dict):
+                peers_raw = peers_raw.get("peers", []) or []
+
+            active_peers = []
+            for p in peers_raw:
+                if not isinstance(p, dict):
+                    continue
+                vip = p.get("ipv4", "").strip()
+                cost = str(p.get("cost", "0"))
+                if vip and vip != cfg.get("IPV4", "") and cost not in ("0", "Local", "none", ""):
+                    active_peers.append({
+                        "ipv4": vip,
+                        "hostname": p.get("hostname", vip),
+                        "cost": cost
+                    })
+
+            if not active_peers:
+                self.send_json({"ok": False, "error": "No active connected peers found in the mesh to sync with."}, status=400)
+                return
+
+            # Phase 1: Prepare all remote peers
+            prep_results = {}
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {
+                    executor.submit(send_cluster_http, p["ipv4"], PORT, "/api/cluster/prepare", current_secret, staged_payload, 6): p
+                    for p in active_peers
+                }
+                for fut in concurrent.futures.as_completed(futures):
+                    p = futures[fut]
+                    try:
+                        ok, res = fut.result()
+                        prep_results[p["ipv4"]] = {"ok": ok, "res": res, "hostname": p["hostname"]}
+                    except Exception as ex:
+                        prep_results[p["ipv4"]] = {"ok": False, "res": str(ex), "hostname": p["hostname"]}
+
+            failed_preps = [f"{v['hostname']} ({ip}): {v['res']}" for ip, v in prep_results.items() if not v["ok"]]
+            if failed_preps:
+                # Abort Phase 1 - Rollback any nodes that prepared
+                for ip, v in prep_results.items():
+                    if v["ok"]:
+                        send_cluster_http(ip, PORT, "/api/cluster/rollback", current_secret, {}, 3)
+                self.send_json({
+                    "ok": False,
+                    "error": f"Preparation failed on {len(failed_preps)} node(s). Sync safely aborted without modifying cluster state.",
+                    "details": failed_preps
+                }, status=500)
+                return
+
+            # Phase 2: Commit remote peers
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                commit_futures = [
+                    executor.submit(send_cluster_http, p["ipv4"], PORT, "/api/cluster/commit", current_secret, {}, 6)
+                    for p in active_peers
+                ]
+                concurrent.futures.wait(commit_futures, timeout=8)
+
+            # Phase 3: Commit Controller locally
+            try:
+                shutil.copy2(CONFIG_FILE, CONFIG_BACKUP_FILE)
+            except Exception:
+                pass
+            for k, v in staged_payload.items():
+                if v != "":
+                    cfg[k] = v
+            save_node_config_env(cfg)
+            arm_rollback_watchdog(timeout_sec=90)
+
+            # Restart local controller service
+            ensure_cli_and_runner_fixed()
+            run_sutun_cmd(["node-restart"])
+
+            # Phase 4: Launch asynchronous confirmation monitor in background (75s with retries)
+            def monitor_and_confirm():
+                time.sleep(4.0)
+                start_check = time.time()
+                while time.time() - start_check < 75.0:
+                    peers = get_easytier_peers()
+                    has_connected_peer = False
+                    if peers:
+                        for p in peers:
+                            if str(p.get("cost", "0")) not in ("0", "Local", "none", ""):
+                                has_connected_peer = True
+                                break
+                    if has_connected_peer:
+                        print("[Cluster-Broadcast] Peers reconnected! Sending confirmation to disarm watchdogs...", flush=True)
+                        for attempt in range(3):
+                            all_ok = True
+                            for p in active_peers:
+                                ok_conf, _ = send_cluster_http(p["ipv4"], PORT, "/api/cluster/confirm", new_secret, {}, 4)
+                                if not ok_conf:
+                                    all_ok = False
+                            if all_ok:
+                                break
+                            time.sleep(1.5)
+                        disarm_rollback_watchdog()
+                        break
+                    time.sleep(2.0)
+
+            threading.Thread(target=monitor_and_confirm, daemon=True).start()
+
+            synced_names = [p["hostname"] for p in active_peers] + [cfg.get("HOSTNAME", "local")]
+            self.send_json({
+                "ok": True,
+                "message": f"Successfully synchronized settings to {len(active_peers)} peer(s). Nodes are restarting with 90s self-healing watchdogs armed.",
+                "synced_nodes": synced_names,
+                "applied_settings": {
+                    "protocol": new_protocol,
+                    "enable_kcp": new_kcp == "yes",
+                    "encryption": new_encryption == "yes",
+                    "ipv6": new_ipv6 == "yes",
+                    "mtu": new_mtu,
+                    "secret_rotated": new_secret != current_secret
+                }
+            })
+            return
+
+        elif path == "/api/cluster/rollback/dismiss":
+            LAST_ROLLBACK["occurred"] = False
+            self.send_json({"ok": True, "message": "Rollback notice dismissed."})
+            return
+
+        elif path == "/api/node/start":
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if ok:
+                self.send_json({"ok": True, "message": "Mesh node service started successfully."})
+            else:
+                self.send_json({"ok": False, "error": msg or "Failed to start node service."}, status=500)
+            return
+
+        elif path == "/api/node/stop":
+            # Stop only the mesh daemon: the CLI "stop" command also stops this web panel.
+            try:
+                r = subprocess.run(["systemctl", "stop", "sutun.service"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+                ok, msg = r.returncode == 0, (r.stderr or r.stdout).strip()
+            except Exception as e:
+                ok, msg = False, str(e)
+            if ok:
+                self.send_json({"ok": True, "message": "Mesh node service stopped."})
+            else:
+                self.send_json({"ok": False, "error": msg or "Failed to stop node service."}, status=500)
+            return
+
+        elif path == "/api/node/restart":
+            ok, msg = run_sutun_cmd(["node-restart"])
+            if ok:
+                self.send_json({"ok": True, "message": "Mesh node service restarted successfully."})
+            else:
+                self.send_json({"ok": False, "error": msg or "Failed to restart node service."}, status=500)
+            return
+
+        elif path == "/api/node/delete":
+            ok, msg = run_sutun_cmd(["delete-node"])
+            if ok:
+                self.send_json({"ok": True, "message": "Mesh node configuration deleted successfully."})
+            else:
+                self.send_json({"ok": False, "error": msg or "Failed to delete node configuration."}, status=400)
+            return
+
+        elif path in ("/api/update/start", "/api/node/update"):
+            ok, msg, code = spawn_detached_node_update()
+            self.send_json({"ok": ok, "code": code, "message": msg, "error": "" if ok else msg,
+                            "status": local_update_summary()}, status=200 if ok else 409 if code == "already_running" else 500)
+            return
+
+        elif path in ("/api/cluster/update", "/api/cluster/update/status"):
+            # Proxy a node action to another mesh server (signed with the network secret),
+            # or handle it here when the target is this server.
+            target_ip = str(data.get("target_ip") or "").strip()
+            cfg = load_env_file(CONFIG_FILE)
+            local_ip = cfg.get("IPV4", "").strip()
+            secret = cfg.get("NETWORK_SECRET", "").strip()
+            if not valid_ipv4(target_ip):
+                self.send_json({"ok": False, "code": "invalid_target", "error": "Missing or invalid target_ip."}, status=400)
+                return
+
+            if target_ip == local_ip or target_ip == "127.0.0.1":
+                if path == "/api/cluster/update":
+                    ok, msg, code = spawn_detached_node_update()
+                    self.send_json({"ok": ok, "code": code, "error": "" if ok else msg, "status": local_update_summary()},
+                                   status=200 if ok else 409 if code == "already_running" else 500)
+                else:
+                    self.send_json({"ok": True, "reachable": True, "status": local_update_summary()})
+                return
+
+            if not secret:
+                self.send_json({"ok": False, "code": "not_configured", "error": "This server has no mesh secret to sign the request."}, status=400)
+                return
+
+            port = PEER_VERSION_CACHE.get(target_ip, {}).get("port", PORT)
+            if path == "/api/cluster/update":
+                ok, res, http_status = True, None, 200
+                if PEER_VERSION_CACHE.get(target_ip, {}).get("branch", "") not in ("", CURRENT_BRANCH):
+                    # A peer still on the removed beta channel would update from beta; move it to main first.
+                    ok, res, http_status = cluster_request(target_ip, port, "/api/cluster/node/channel", secret, {"channel": "stable"}, 6)
+                    ok = ok and isinstance(res, dict) and res.get("ok", True)
+                if ok:
+                    ok, res, http_status = cluster_request(target_ip, port, "/api/cluster/node/update", secret, {}, 10)
+                if ok and isinstance(res, dict):
+                    # Peers before 2.2.6-beta.5 answer without a code; their update runs untracked.
+                    legacy = "code" not in res
+                    self.send_json({"ok": bool(res.get("ok", True)), "code": res.get("code") or "queued", "legacy": legacy,
+                                    "error": res.get("error", ""), "status": res.get("status") or {}},
+                                   status=200 if res.get("ok", True) else 409)
+                    return
+            else:
+                ok, res, http_status = cluster_request(target_ip, port, "/api/cluster/node/update-status", secret, {}, 4)
+                if ok and isinstance(res, dict):
+                    status = res.get("status") or {}
+                    if (status.get("update") or {}).get("state") in ("success", "failed", "up_to_date"):
+                        PEER_VERSION_CACHE.pop(target_ip, None)  # the peers list must show the new version now
+                    self.send_json({"ok": True, "reachable": True, "status": status})
+                    return
+                if http_status == 404 or http_status is None:
+                    # Too old for status reports, or restarting mid-update: fall back to its public version probe.
+                    PEER_VERSION_CACHE.pop(target_ip, None)
+                    info, _, _ = fetch_peer_cluster_info(target_ip, port, timeout=2.0)
+                    self.send_json({"ok": True, "reachable": bool(info), "legacy": http_status == 404,
+                                    "status": {"version": info.get("version", "")} if info else {}})
+                    return
+
+            code = res.get("code") if isinstance(res, dict) and res.get("code") else cluster_error_code(http_status)
+            error = res.get("error") if isinstance(res, dict) else str(res)
+            self.send_json({"ok": False, "code": code, "error": error or "Request to the peer failed."}, status=502)
+            return
+
+        self.send_error(404, "Endpoint not found")
+
+
+def run_server():
+    """Start the HTTP server on configured BIND_ADDR and PORT."""
+    # Ensure tokens directory exists
+    try:
+        os.makedirs(os.path.dirname(WEB_TOKEN_FILE), exist_ok=True)
+    except Exception:
+        pass
+
+    # Ensure runner and CLI are properly patched for pure UDP
+    ensure_cli_and_runner_fixed()
+
+    # Prefetch and verify sutun script in background
+    threading.Thread(target=ensure_sutun_script, daemon=True).start()
+
+    # Threading server to handle multiple simultaneous requests (e.g. live status + ping)
+    class ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+        allow_reuse_address = True
+
+    server = ThreadedHTTPServer((BIND_ADDR, PORT), SuTunHandler)
+
+    # Initialize SSL/TLS if certificates are configured
+    web_env = load_env_file(WEB_ENV_FILE)
+    ssl_cert = os.environ.get("WEB_SSL_CERT") or web_env.get("WEB_SSL_CERT", "")
+    ssl_key = os.environ.get("WEB_SSL_KEY") or web_env.get("WEB_SSL_KEY", "")
+    ssl_active = False
+
+    if ssl_cert and ssl_key and os.path.isfile(ssl_cert) and os.path.isfile(ssl_key):
+        try:
+            ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            ssl_ctx.load_cert_chain(certfile=ssl_cert, keyfile=ssl_key)
+            server.socket = ssl_ctx.wrap_socket(server.socket, server_side=True)
+            ssl_active = True
+            domain = web_env.get("WEB_DOMAIN", BIND_ADDR)
+            print(f"[*] SSL/TLS enabled! SuTun Web Daemon securely serving HTTPS on https://{domain}:{PORT}", flush=True)
+        except Exception as e:
+            print(f"[!] Warning: Failed to initialize SSL/TLS: {e}. Falling back to plain HTTP.", flush=True)
+
+    if not ssl_active:
+        print(f"[*] SuTun Web Daemon listening on http://{BIND_ADDR}:{PORT}", flush=True)
+
+    shutdown_done = threading.Event()
+
+    def shutdown_signal(sig, frame):
+        print(f"\n[*] Received signal {sig}, shutting down SuTun Web Daemon...", flush=True)
+        # socketserver.shutdown() blocks until serve_forever() finishes.
+        # It MUST run on a different thread than serve_forever() to prevent deadlocking.
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+        # Fallback watchdog: if graceful shutdown exceeds 2.0 seconds, force immediate exit
+        def watchdog():
+            if not shutdown_done.wait(timeout=2.0):
+                print("[*] Forcing process termination...", flush=True)
+                os._exit(0)
+
+        threading.Thread(target=watchdog, daemon=True).start()
+
+    signal.signal(signal.SIGINT, shutdown_signal)
+    signal.signal(signal.SIGTERM, shutdown_signal)
+
+    try:
+        server.serve_forever(poll_interval=0.2)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        shutdown_done.set()
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        print("[*] SuTun Web Daemon stopped cleanly.", flush=True)
+
+
+if __name__ == "__main__":
+    run_server()

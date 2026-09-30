@@ -1,0 +1,5900 @@
+#!/usr/bin/env bash
+# SuTun - EasyTier mesh network manager
+# Developed by mdjes
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+readonly APP="SuTun"
+readonly VERSION="3.1.0"
+readonly DEFAULT_BRANCH="main"
+readonly OWNER="mdjes"
+readonly INSTALL_DIR="/opt/sutun"
+readonly BIN_DIR="${INSTALL_DIR}/bin"
+readonly CONFIG_FILE="/etc/sutun/config.env"
+readonly SERVICE_FILE="/etc/systemd/system/sutun.service"
+readonly HAPROXY_SERVICE_FILE="/etc/systemd/system/sutun-haproxy.service"
+readonly HAPROXY_CONFIG="/etc/sutun/haproxy.cfg"
+readonly HAPROXY_TUNNEL_DIR="${HAPROXY_TUNNEL_DIR:-/etc/sutun/haproxy-tunnels}"
+readonly IPTABLES_SERVICE_FILE="/etc/systemd/system/sutun-iptables.service"
+readonly IPTABLES_TUNNEL_DIR="${IPTABLES_TUNNEL_DIR:-/etc/sutun/iptables-tunnels}"
+readonly IPTABLES_APPLY_SCRIPT="${INSTALL_DIR}/sutun-iptables-apply"
+readonly IPTABLES_SYSCTL_FILE="/etc/sysctl.d/99-sutun-forwarding.conf"
+readonly GOST_BIN="${BIN_DIR}/gost"
+readonly GOST_SERVICE_FILE="/etc/systemd/system/sutun-gost.service"
+readonly GOST_CONFIG_FILE="${GOST_CONFIG_FILE:-/etc/sutun/gost.json}"
+readonly GOST_TUNNEL_DIR="${GOST_TUNNEL_DIR:-/etc/sutun/gost-tunnels}"
+readonly FALLBACK_GOST_VERSION="v3.3.0"
+readonly REALM_BIN="${BIN_DIR}/realm"
+readonly REALM_SERVICE_FILE="/etc/systemd/system/sutun-realm.service"
+readonly REALM_CONFIG_FILE="${REALM_CONFIG_FILE:-/etc/sutun/realm.json}"
+readonly REALM_TUNNEL_DIR="${REALM_TUNNEL_DIR:-/etc/sutun/realm-tunnels}"
+readonly FALLBACK_REALM_VERSION="v2.6.2"
+# ICMP and PCK transports: BackPack (https://github.com/AminMGMT/BackPack, AGPL-3.0) runs as a
+# separate, unmodified binary. Its direct layer-3 tunnel carries packets inside ICMP echo (xDi
+# carrier) or inside TCP segments built without the kernel's TCP stack (pck carrier), and
+# EasyTier peers across the resulting point-to-point link. Both carriers share the link files,
+# addresses and units below, which keep their original "icmp" names so existing links survive.
+readonly BACKPACK_BIN="${BIN_DIR}/backpack"
+# Both ends of a link must run the same BackPack version, so it is pinned with its checksums.
+readonly BACKPACK_VERSION="v1.8.4"
+readonly ICMP_LINK_DIR="${ICMP_LINK_DIR:-/etc/sutun/icmp-links}"
+readonly ICMP_SERVICE_TEMPLATE="/etc/systemd/system/sutun-icmp@.service"
+# Each link takes one /30 from 10.214.0.0/16: index N maps to 10.214.(N/64).(N%64*4).
+readonly ICMP_LINK_PREFIX="10.214"
+readonly ICMP_LINK_MAX_INDEX=16383
+# EasyTier MTU across a BackPack link: the link interface is 1380-1400, minus ~72 bytes of EasyTier framing.
+readonly ICMP_MESH_MTU="1280"
+# BackPack's interface MTU on a pck link: pck costs 52 bytes per packet against xDi's 33.
+readonly PCK_LINK_MTU="1380"
+# A pck link listens on a real TCP port. It stays below the kernel's ephemeral range (32768+),
+# where an outgoing connection could take the same local port and answer the link's segments.
+readonly PCK_PORT_MIN=20000
+readonly PCK_PORT_MAX=32767
+readonly WEB_DIR="${INSTALL_DIR}/web"
+readonly WEB_CONFIG_FILE="/etc/sutun/web.env"
+readonly WEB_SERVICE_FILE="/etc/systemd/system/sutun-web.service"
+readonly UPDATE_STATUS_FILE="${SUTUN_UPDATE_STATUS_FILE:-/var/lib/sutun/update-status.json}"
+readonly UPDATE_LOCK_FILE="${SUTUN_UPDATE_LOCK_FILE:-/run/sutun-update.lock}"
+readonly UPDATE_BACKUP_DIR="${INSTALL_DIR}/backups"
+readonly IPERF_SERVICE_FILE="/etc/systemd/system/sutun-iperf.service"
+readonly IPERF_RUNNER="${INSTALL_DIR}/sutun-iperf-runner"
+readonly WEB_TOKEN_FILE="/etc/sutun/web-tokens.json"
+readonly DEFAULT_WEB_PORT="11080"
+# One row per kind of port-forwarding tunnel: "kind|label|definitions dir|service unit".
+# apply_<kind>_config rebuilds and starts that kind from its saved definitions.
+readonly TUNNEL_KINDS=(
+  "haproxy|HAProxy|${HAPROXY_TUNNEL_DIR}|sutun-haproxy.service"
+  "iptables|iptables|${IPTABLES_TUNNEL_DIR}|sutun-iptables.service"
+  "gost|GOST|${GOST_TUNNEL_DIR}|sutun-gost.service"
+  "realm|Realm|${REALM_TUNNEL_DIR}|sutun-realm.service"
+)
+readonly LOG_TAG="sutun"
+readonly FALLBACK_EASYTIER_VERSION="v2.6.4"
+
+# Releases and updates come only from main; the beta channel was removed. An
+# SUTUN_BRANCH left by a beta install is ignored and rewritten to main on update.
+get_active_branch() {
+  echo "$DEFAULT_BRANCH"
+}
+
+if [[ -t 1 ]]; then
+  readonly RESET=$'\033[0m' BOLD=$'\033[1m' DIM=$'\033[2m'
+  readonly CYAN=$'\033[38;5;45m' BLUE=$'\033[38;5;75m'
+  readonly PURPLE=$'\033[38;5;141m' PINK=$'\033[38;5;213m'
+  readonly GREEN=$'\033[38;5;84m' YELLOW=$'\033[38;5;220m'
+  readonly RED=$'\033[38;5;203m' GRAY=$'\033[38;5;245m'
+  # Background of the highlighted row in menus and pickers.
+  readonly SEL_BG=$'\033[48;5;237m'
+else
+  readonly RESET="" BOLD="" DIM="" CYAN="" BLUE="" PURPLE="" PINK="" GREEN="" YELLOW="" RED="" GRAY="" SEL_BG=""
+fi
+
+# ---------------------------------------------------------------------------
+# Terminal UI and Ctrl+C
+# Every screen opened from the menu runs in its own subshell (run_screen), so
+# Ctrl+C ends that screen and the menu redraws. Anywhere else Ctrl+C cancels
+# the command. The handler must always exit: when it returned, "read" went on
+# waiting and the terminal looked frozen until the SSH session was closed.
+# ---------------------------------------------------------------------------
+MENU_PID=0       # PID of the menu loop while it runs
+MENU_IDLE=0      # 1 while the menu itself, not a screen, owns the terminal
+UI_PAUSED=1      # 0 once a screen printed something the user has not dismissed
+UI_ROWS=24
+UI_COLS=80
+UI_KEY=""
+CANCEL_NOTE="Cancelled."
+CANCEL_HOOKS=()  # commands a cancelled screen runs before it exits
+
+trap 'printf "\n%bError on line %s. Check the logs for details.%b\n" "$RED" "$LINENO" "$RESET" >&2' ERR
+
+ui_interactive() { [[ -t 0 && -t 1 ]]; }
+
+# Undo what menus and pickers change: hidden cursor, line wrap, key echo.
+ui_restore_terminal() {
+  if [[ -t 1 ]]; then printf '\033[?25h\033[?7h'; fi
+  if [[ -t 0 ]]; then stty echo icanon 2>/dev/null || true; fi
+}
+
+# on_cancel <command>: run <command> if Ctrl+C cancels the current screen or command.
+on_cancel() { CANCEL_HOOKS+=("$1"); }
+
+handle_interrupt() {
+  if (( MENU_PID && BASHPID == MENU_PID )); then
+    # A screen is running: its own subshell handles Ctrl+C and the menu redraws.
+    (( MENU_IDLE )) || return 0
+    ui_restore_terminal
+    printf '\033[H\033[2J'
+    printf '\n%b  SuTun closed. Run %bsutun%b%b to open the menu again.%b\n\n' "$CYAN" "$BOLD" "$RESET" "$CYAN" "$RESET"
+    exit 0
+  fi
+  local hook
+  trap '' INT  # a second Ctrl+C must not cut the cleanup short
+  for hook in "${CANCEL_HOOKS[@]}"; do
+    eval "$hook" >/dev/null 2>&1 || true
+  done
+  ui_restore_terminal
+  [[ -n "$CANCEL_NOTE" ]] && printf '\n%b  ✗ %s%b\n' "$YELLOW" "$CANCEL_NOTE" "$RESET" >&2
+  exit 130
+}
+
+trap 'handle_interrupt' INT
+
+say() { printf '%b%s%b\n' "$2" "$1" "$RESET"; UI_PAUSED=0; }
+ok() { say "  ✓ $*" "$GREEN"; }
+warn() { say "  ! $*" "$YELLOW"; }
+fail() { say "  ✗ $*" "$RED" >&2; }
+info() { say "  › $*" "$BLUE"; }
+
+pause() {
+  UI_PAUSED=1
+  [[ -t 0 ]] || return 0
+  printf '\n  %b╰─ Press any key to continue%b ' "$DIM$GRAY" "$RESET"
+  IFS= read -rsn1 _ || true
+  # Drop the rest of a multi-byte key (arrows) so the next prompt does not receive it.
+  while IFS= read -rsn1 -t 0.02 _; do :; done
+  printf '\n'
+  return 0
+}
+
+# ui_line <width> [char]: print a horizontal line.
+ui_line() {
+  local line
+  printf -v line '%*s' "$1" ''
+  printf '%s' "${line// /${2:-─}}"
+}
+
+ui_term_size() {
+  local size=""
+  [[ -t 0 ]] && size="$(stty size 2>/dev/null || true)"
+  UI_ROWS="${size%% *}"
+  UI_COLS="${size##* }"
+  [[ "$UI_ROWS" =~ ^[0-9]+$ ]] && (( UI_ROWS > 0 )) || UI_ROWS="${LINES:-24}"
+  [[ "$UI_COLS" =~ ^[0-9]+$ ]] && (( UI_COLS > 0 )) || UI_COLS="${COLUMNS:-80}"
+}
+
+# Width of boxes and rules: the terminal minus margins, between 40 and 72 columns.
+ui_width() {
+  local w=$(( UI_COLS - 4 ))
+  (( w > 72 )) && w=72
+  (( w < 40 )) && w=40
+  printf '%d' "$w"
+}
+
+section() {
+  local w
+  w="$(ui_width)"
+  printf '\n  %b◆ %s%b\n' "$BOLD$CYAN" "$1" "$RESET"
+  printf '  %b%s%b\n' "$DIM$BLUE" "$(ui_line "$w")" "$RESET"
+  UI_PAUSED=0
+}
+
+# ui_kv <label> <value> [colour]: one "label  value" row inside a card.
+ui_kv() {
+  printf '  %b│%b  %b%-16s%b %b%s%b\n' "$DIM$BLUE" "$RESET" "$GRAY" "$1" "$RESET" "${3:-}" "$2" "$RESET"
+  UI_PAUSED=0
+}
+
+# Compact title bar at the top of every screen.
+ui_title_bar() {
+  local w inner title="SuTun" tagline="EasyTier Mesh Manager" version="v${VERSION}" pad
+  w="$(ui_width)"
+  inner=$(( w - 2 ))
+  # The row is "  ◆ " + title + "  " + tagline + padding + version + "  ".
+  pad=$(( inner - 4 - ${#title} - 2 - ${#tagline} - ${#version} - 2 ))
+  (( pad < 1 )) && pad=1
+  printf '  %b╭%s╮%b\n' "$DIM$BLUE" "$(ui_line "$inner")" "$RESET"
+  printf '  %b│%b  %b◆ %s%b  %b%s%b%*s%b%s%b  %b│%b\n' \
+    "$DIM$BLUE" "$RESET" "$BOLD$CYAN" "$title" "$RESET" "$PINK" "$tagline" "$RESET" \
+    "$pad" "" "$GRAY" "$version" "$RESET" "$DIM$BLUE" "$RESET"
+  printf '  %b╰%s╯%b\n' "$DIM$BLUE" "$(ui_line "$inner")" "$RESET"
+}
+
+# Large logo for the main menu when the terminal is tall enough.
+ui_logo() {
+  # shellcheck disable=SC1003  # the backslashes are part of the art
+  local -a art=(
+    '   _____      ______          '
+    '  / ___/__  _/_  __/_  ______ '
+    '  \__ \/ / / // / / / / / __ \'
+    ' ___/ / /_/ // / / /_/ / / / /'
+    '/____/\__,_//_/  \__,_/_/ /_/ '
+    '                              '
+  )
+  local -a tint=("$CYAN" "$CYAN" "$BLUE" "$BLUE" "$PURPLE" "$PURPLE")
+  local i
+  for i in "${!art[@]}"; do
+    printf '  %b%s%b\n' "$BOLD${tint[i]}" "${art[i]}" "$RESET"
+  done
+  printf '  %bEasyTier Mesh Manager%b  %b·%b  v%s  %b·%b  by %s\n' \
+    "$BOLD$PINK" "$RESET" "$GRAY" "$RESET" "$VERSION" "$GRAY" "$RESET" "$OWNER"
+}
+
+header() {
+  # Screens also run from the web panel, which reads their output; only draw for a terminal.
+  [[ -t 1 ]] || return 0
+  printf '\033[H\033[2J\033[3J'
+  ui_term_size
+  ui_title_bar
+  UI_PAUSED=0
+}
+
+# ui_read_key: wait up to a second for one key and store it in UI_KEY as
+# up, down, home, end, pgup, pgdn, enter, esc, backspace, other, or the character.
+# Returns 1 at the end of input and 2 when no key was pressed.
+ui_read_key() {
+  local key="" rest="" status
+  UI_KEY=""
+  IFS= read -rsn1 -t 1 key
+  status=$?
+  (( status > 128 )) && return 2
+  (( status == 0 )) || return 1
+  case "$key" in
+    "") UI_KEY="enter"; return 0 ;;
+    $'\177'|$'\b') UI_KEY="backspace"; return 0 ;;
+    $'\033') ;;
+    *) UI_KEY="$key"; return 0 ;;
+  esac
+  IFS= read -rsn2 -t 0.05 rest || true
+  case "$rest" in
+    '[A'|'OA') UI_KEY="up" ;;
+    '[B'|'OB') UI_KEY="down" ;;
+    '[H'|'OH') UI_KEY="home" ;;
+    '[F'|'OF') UI_KEY="end" ;;
+    '[1'|'[7') UI_KEY="home" ;;
+    '[4'|'[8') UI_KEY="end" ;;
+    '[5') UI_KEY="pgup" ;;
+    '[6') UI_KEY="pgdn" ;;
+    '') UI_KEY="esc" ;;
+    *) UI_KEY="other" ;;
+  esac
+  # Drop the rest of a longer sequence, such as the "~" of Home or Page Up.
+  while IFS= read -rsn1 -t 0.01 _; do :; done
+  return 0
+}
+
+# ui_choose <var> <default index> <option>...: arrow-key picker drawn in place.
+# Stores the chosen index (0-based) in <var>; returns 1 when the user backs out.
+ui_choose() {
+  local -n _uc_out="$1"
+  local _uc_sel="$2" _uc_i _uc_n _uc_drawn=0 _uc_w _uc_pad _uc_line _uc_frame _uc_answer _uc_status
+  shift 2
+  local -a _uc_opts=("$@")
+  _uc_n=${#_uc_opts[@]}
+  (( _uc_sel >= 0 && _uc_sel < _uc_n )) || _uc_sel=0
+
+  if ! ui_interactive; then
+    for _uc_i in "${!_uc_opts[@]}"; do
+      printf '  [%d] %s\n' $(( _uc_i + 1 )) "${_uc_opts[_uc_i]}"
+    done
+    read -r -p "  Select [1-${_uc_n}, default: $(( _uc_sel + 1 ))]: " _uc_answer || return 1
+    _uc_answer="${_uc_answer:-$(( _uc_sel + 1 ))}"
+    [[ "$_uc_answer" =~ ^[0-9]+$ ]] && (( _uc_answer >= 1 && _uc_answer <= _uc_n )) || return 1
+    _uc_out=$(( _uc_answer - 1 ))
+    return 0
+  fi
+
+  ui_term_size
+  _uc_w="$(ui_width)"
+  # Hide the cursor and turn off line wrap, so every option is exactly one line to redraw.
+  printf '\033[?25l\033[?7l'
+  while :; do
+    _uc_frame=""
+    (( _uc_drawn )) && _uc_frame+=$'\033'"[${_uc_drawn}A"$'\r'
+    for _uc_i in "${!_uc_opts[@]}"; do
+      if (( _uc_i == _uc_sel )); then
+        _uc_pad=$(( _uc_w - 8 - ${#_uc_opts[_uc_i]} ))
+        (( _uc_pad < 1 )) && _uc_pad=1
+        printf -v _uc_line '  %s❯%s %s %d  %s%*s%s' "$CYAN" "$RESET" "$SEL_BG$BOLD" \
+          $(( _uc_i + 1 )) "${_uc_opts[_uc_i]}" "$_uc_pad" "" "$RESET"
+      else
+        printf -v _uc_line '     %s%d%s  %s' "$GRAY" $(( _uc_i + 1 )) "$RESET" "${_uc_opts[_uc_i]}"
+      fi
+      _uc_frame+="${_uc_line}"$'\033[K\n'
+    done
+    _uc_frame+="  ${DIM}${GRAY}↑/↓ move · Enter select · q back${RESET}"$'\033[K\n'
+    printf '%s' "$_uc_frame"
+    _uc_drawn=$(( _uc_n + 1 ))
+
+    _uc_status=0
+    ui_read_key || _uc_status=$?
+    case $_uc_status in
+      1) UI_KEY="esc" ;;
+      2) continue ;;
+    esac
+    case "$UI_KEY" in
+      up|k) (( _uc_sel = (_uc_sel - 1 + _uc_n) % _uc_n )) ;;
+      down|j|$'\t') (( _uc_sel = (_uc_sel + 1) % _uc_n )) ;;
+      home|pgup) _uc_sel=0 ;;
+      end|pgdn) _uc_sel=$(( _uc_n - 1 )) ;;
+      [1-9]) (( UI_KEY <= _uc_n )) && _uc_sel=$(( UI_KEY - 1 )) ;;
+      enter) break ;;
+      esc|q|Q)
+        printf '\033[%dA\r\033[J\033[?7h\033[?25h' "$_uc_drawn"
+        printf '  %b‹ Back%b\n' "$DIM$GRAY" "$RESET"
+        return 1
+        ;;
+    esac
+  done
+  printf '\033[%dA\r\033[J\033[?7h\033[?25h' "$_uc_drawn"
+  printf '  %b✓%b %s\n' "$GREEN" "$RESET" "${_uc_opts[_uc_sel]}"
+  _uc_out="$_uc_sel"
+  return 0
+}
+
+# ask <var> <question> [default]: read one line with line editing (arrows,
+# Home/End) into <var>; an empty answer takes the default.
+ask() {
+  local -n _ask_out="$1"
+  local _ask_q="$2" _ask_default="${3-}" _ask_line="" _ask_prompt _ask_so=$'\001' _ask_sc=$'\002'
+  if [[ -t 0 ]]; then
+    # \001 and \002 mark the colour codes so readline measures the prompt correctly.
+    _ask_prompt="  ${_ask_so}${BOLD}${CYAN}${_ask_sc}?${_ask_so}${RESET}${_ask_sc} ${_ask_q}"
+    [[ -n "$_ask_default" ]] && _ask_prompt+=" ${_ask_so}${GRAY}${_ask_sc}[${_ask_default}]${_ask_so}${RESET}${_ask_sc}"
+    read -e -r -p "${_ask_prompt}: " _ask_line || _ask_line=""
+  else
+    read -r _ask_line || _ask_line=""
+  fi
+  _ask_out="${_ask_line:-$_ask_default}"
+}
+
+# ask_secret <var> <question>: read without echo.
+ask_secret() {
+  local -n _secret_out="$1"
+  local _secret_line=""
+  read -r -s -p "  ${BOLD}${CYAN}?${RESET} $2: " _secret_line || _secret_line=""
+  printf '\n'
+  _secret_out="$_secret_line"
+}
+
+# ask_yes_no <question> <default yes|no>: returns 0 for yes.
+ask_yes_no() {
+  local question="$1" default="${2:-no}" answer hint="y/N"
+  default="${default,,}"
+  [[ "$default" == y ]] && default="yes"
+  [[ "$default" == yes ]] && hint="Y/n"
+  while :; do
+    ask answer "${question} (${hint})"
+    answer="${answer,,}"
+    [[ -z "$answer" ]] && answer="$default"
+    case "$answer" in
+      y|yes) return 0 ;;
+      n|no) return 1 ;;
+    esac
+    warn "Answer yes or no."
+  done
+}
+
+# ask_yes_no_into <var> <question> <default yes|no>: store "yes" or "no" in <var>.
+ask_yes_no_into() {
+  if ask_yes_no "$2" "$3"; then
+    printf -v "$1" '%s' yes
+  else
+    printf -v "$1" '%s' no
+  fi
+}
+
+# Run one menu screen in its own subshell, so Ctrl+C or a failure inside it
+# ends only that screen. A screen that printed something and returned
+# without waiting gets a "press any key" before the menu redraws.
+run_screen() {
+  local status=0
+  MENU_IDLE=0
+  ui_restore_terminal
+  (
+    trap 'handle_interrupt' INT
+    CANCEL_HOOKS=()
+    UI_PAUSED=1
+    screen_status=0
+    "$@" || screen_status=$?
+    (( UI_PAUSED )) || pause
+    exit "$screen_status"
+  ) || status=$?
+  MENU_IDLE=1
+  # Leave the "Cancelled" line on screen for a moment before the menu redraws.
+  (( status == 130 )) && sleep 0.4
+  return "$status"
+}
+
+require_root() {
+  if (( EUID != 0 )); then
+    fail "This command must be run as root: sudo bash $0"
+    exit 1
+  fi
+}
+
+require_linux() {
+  [[ "$(uname -s)" == "Linux" ]] || { fail "Only Linux is supported."; exit 1; }
+  command -v systemctl >/dev/null || { fail "systemd was not found on this system."; exit 1; }
+}
+
+install_dependencies() {
+  local missing=()
+  local cmd
+  for cmd in curl unzip openssl ip ping figlet jq sha256sum ss python3 iperf3 tar; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  ((${#missing[@]} == 0)) && return
+  info "Installing dependencies..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq curl unzip openssl iproute2 iputils-ping ca-certificates figlet jq python3 iperf3 tar
+}
+
+arch_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "easytier-linux-x86_64" ;;
+    aarch64|arm64) echo "easytier-linux-aarch64" ;;
+    armv7l|armv7) echo "easytier-linux-armv7" ;;
+    *) fail "Unsupported architecture: $(uname -m)"; return 1 ;;
+  esac
+}
+
+install_core() {
+  require_root
+  install_dependencies
+  local version asset asset_name url digest actual_digest tmp release_json
+  asset="$(arch_asset)"
+  tmp="$(mktemp -d)"
+  release_json="${tmp}/release.json"
+  if ! curl -fsSL --connect-timeout 8 --max-time 20 \
+    https://api.github.com/repos/EasyTier/EasyTier/releases/latest -o "$release_json"; then
+    warn "Latest-release lookup failed; checking the pinned fallback release."
+    curl -fsSL --connect-timeout 8 --max-time 20 \
+      "https://api.github.com/repos/EasyTier/EasyTier/releases/tags/${FALLBACK_EASYTIER_VERSION}" \
+      -o "$release_json" || { fail "Could not retrieve trusted EasyTier release metadata."; rm -rf -- "$tmp"; return 1; }
+  fi
+  version="$(jq -er '.tag_name' "$release_json")" ||
+    { fail "EasyTier release metadata is invalid."; rm -rf -- "$tmp"; return 1; }
+  asset_name="${asset}-${version}.zip"
+  url="$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")" ||
+    { fail "No official EasyTier asset exists for $(uname -m)."; rm -rf -- "$tmp"; return 1; }
+  digest="$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .digest' "$release_json")" ||
+    { fail "The official release did not provide a checksum for ${asset_name}."; rm -rf -- "$tmp"; return 1; }
+  [[ "$digest" =~ ^sha256:([0-9a-fA-F]{64})$ ]] ||
+    { fail "The official checksum has an unexpected format."; rm -rf -- "$tmp"; return 1; }
+  digest="${BASH_REMATCH[1],,}"
+
+  info "Downloading EasyTier ${version} for $(uname -m)..."
+  mkdir -p "$BIN_DIR" /etc/sutun
+  if ! curl -fL --retry 3 --connect-timeout 10 --progress-bar "$url" -o "${tmp}/core.zip"; then
+    fail "Download failed: $url"
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  actual_digest="$(sha256sum "${tmp}/core.zip" | awk '{print $1}')"
+  if [[ "$actual_digest" != "$digest" ]]; then
+    fail "EasyTier archive checksum verification failed. Nothing was installed."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  ok "EasyTier archive SHA-256 verified."
+  unzip -q -o "${tmp}/core.zip" -d "$tmp"
+  local core cli
+  core="$(find "$tmp" -type f -name easytier-core | head -n1)"
+  cli="$(find "$tmp" -type f -name easytier-cli | head -n1)"
+  if [[ -z "$core" || -z "$cli" ]]; then
+    fail "EasyTier binaries were not found in the downloaded archive."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  install -m 0755 "$core" "${BIN_DIR}/easytier-core"
+  install -m 0755 "$cli" "${BIN_DIR}/easytier-cli"
+  printf '%s\n' "$version" > "${INSTALL_DIR}/easytier.version"
+  rm -rf -- "$tmp"
+  ok "EasyTier ${version} installed successfully."
+}
+
+valid_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^10\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] &&
+    (( BASH_REMATCH[1] <= 255 && BASH_REMATCH[2] <= 255 && BASH_REMATCH[3] <= 255 ))
+}
+
+valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
+
+valid_mtu() { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 576 && "$1" <= 9000 )); }
+
+write_config() {
+  local name="$1" secret="$2" hostname="$3" ipv4="$4" protocol="$5" port="$6" peers="$7"
+  local encryption="$8" ipv6="$9" mtu="${10}"
+  local enable_kcp="${11:-no}" multi_thread="${12:-no}"
+
+  # Pre-sanitize stored peers list
+  local clean_peers=()
+  if [[ -n "$peers" ]]; then
+    IFS=',' read -ra raw_p_list <<< "$peers"
+    for p in "${raw_p_list[@]}"; do
+      p="${p//[[:space:]]/}"
+      [[ -z "$p" ]] && continue
+      p="${p%/}"
+      while [[ "$p" == *: ]]; do p="${p%:}"; done
+      [[ "$p" =~ ^:+ || "$p" =~ ^[0-9]+$ ]] && continue
+      if [[ ! "$p" =~ \[.*\] && "$p" =~ ^(.+):+([0-9]+)$ ]]; then
+        local ph="${BASH_REMATCH[1]}"
+        while [[ "$ph" == *: ]]; do ph="${ph%:}"; done
+        p="${ph}:${BASH_REMATCH[2]}"
+      fi
+      clean_peers+=("$p")
+    done
+  fi
+  local peers_formatted=""
+  if ((${#clean_peers[@]})); then
+    peers_formatted="$(IFS=','; echo "${clean_peers[*]}")"
+  fi
+
+  umask 077
+  {
+    printf 'NETWORK_NAME=%q\n' "$name"
+    printf 'NETWORK_SECRET=%q\n' "$secret"
+    printf 'HOSTNAME=%q\n' "$hostname"
+    printf 'IPV4=%q\n' "$ipv4"
+    printf 'PROTOCOL=%q\n' "$protocol"
+    printf 'PORT=%q\n' "$port"
+    printf 'PEERS=%q\n' "$peers_formatted"
+    printf 'ENCRYPTION=%q\n' "$encryption"
+    printf 'IPV6=%q\n' "$ipv6"
+    printf 'MTU=%q\n' "$mtu"
+    printf 'ENABLE_KCP=%q\n' "$enable_kcp"
+    printf 'MULTI_THREAD=%q\n' "$multi_thread"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+write_service() {
+  cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=SuTun - EasyTier Mesh Node
+Documentation=https://github.com/EasyTier/EasyTier
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+EnvironmentFile=${CONFIG_FILE}
+ExecStart=${INSTALL_DIR}/sutun-runner
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+ReadWritePaths=/var/log
+SyslogIdentifier=${LOG_TAG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  write_runner
+  write_iperf_service
+  systemctl daemon-reload
+}
+
+write_runner() {
+  cat > "${INSTALL_DIR}/sutun-runner" <<'RUNNER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+source /etc/sutun/config.env
+proto_lower="$(echo "${PROTOCOL:-dual}" | tr '[:upper:]' '[:lower:]')"
+
+# A BackPack link (ICMP or PCK) adds ~66-105 bytes per packet, so a standard mesh MTU would fragment every full packet.
+mesh_mtu="${MTU:-1380}"
+if [[ "$proto_lower" =~ ^(icmp|pck)$ && "$mesh_mtu" =~ ^[0-9]+$ ]] && (( mesh_mtu > 1300 )); then
+  mesh_mtu=1280
+fi
+
+args=(
+  --hostname "$HOSTNAME"
+  --network-name "$NETWORK_NAME"
+  --network-secret "$NETWORK_SECRET"
+  --ipv4 "$IPV4"
+  --rpc-portal "127.0.0.1:15888"
+  --mtu "$mesh_mtu"
+)
+
+# Protocol EasyTier prefers for direct connections; it falls back to any listener the peer advertises.
+if [[ "$proto_lower" == "tcp" || "$proto_lower" == "ws" || "$proto_lower" == "wss" ]]; then
+  args+=(--default-protocol "tcp")
+else
+  args+=(--default-protocol "udp")
+fi
+
+# Configure listeners based on protocol (always use explicit URI schemes)
+case "$proto_lower" in
+  tcp)
+    args+=(--listeners "tcp://0.0.0.0:${PORT}")
+    ;;
+  udp)
+    args+=(--listeners "udp://0.0.0.0:${PORT}")
+    ;;
+  ws)
+    args+=(--listeners "ws://0.0.0.0:${PORT}/")
+    ;;
+  wss)
+    args+=(--listeners "wss://0.0.0.0:${PORT}/")
+    ;;
+  quic)
+    # QUIC mode: enable QUIC listener with proxy and TCP fallback for strict firewall environments
+    args+=(--listeners "quic://0.0.0.0:${PORT}" --listeners "tcp://0.0.0.0:${PORT}" --enable-quic-proxy)
+    ;;
+  faketcp)
+    args+=(--listeners "faketcp://0.0.0.0:${PORT}")
+    ;;
+  icmp|pck)
+    # ICMP/PCK peers arrive over BackPack link interfaces (xrmi*); the same UDP listener serves direct peers.
+    # EasyTier otherwise binds peer sockets to the physical NIC (it skips tun devices), which would
+    # send traffic for the link's 10.214.x.x address out of eth0 instead of into the BackPack link.
+    args+=(--listeners "udp://0.0.0.0:${PORT}" --bind-device false)
+    ;;
+  dual|*)
+    args+=(--listeners "tcp://0.0.0.0:${PORT}" --listeners "udp://0.0.0.0:${PORT}")
+    ;;
+esac
+
+# KCP Loss-Resistance Proxy
+if [[ "${ENABLE_KCP:-no}" == "yes" ]]; then
+  args+=(--enable-kcp-proxy)
+fi
+
+[[ "${IPV6:-no}" == "no" ]] && args+=(--disable-ipv6)
+[[ "${ENCRYPTION:-yes}" == "no" ]] && args+=(--disable-encryption)
+[[ "${MULTI_THREAD:-no}" == "yes" ]] && args+=(--multi-thread)
+
+# Only accept networks that share this mesh's secret. Without it, anyone running EasyTier
+# could connect with another network name and use this server as a free public relay.
+args+=(--private-mode true)
+
+if [[ -n "${PEERS:-}" ]]; then
+  IFS=',' read -ra peer_list <<< "$PEERS"
+  peer_args=()
+  for peer in "${peer_list[@]}"; do
+    peer="${peer//[[:space:]]/}"
+    [[ -z "$peer" ]] && continue
+
+    p_scheme=""
+    if [[ "$peer" == *"://"* ]]; then
+      p_scheme="${peer%%://*}"
+      p_hostport="${peer#*://}"
+    else
+      p_hostport="$peer"
+    fi
+
+    # Strip trailing slashes and colons
+    p_hostport="${p_hostport%/}"
+    while [[ "$p_hostport" == *: ]]; do
+      p_hostport="${p_hostport%:}"
+    done
+
+    if [[ "$p_hostport" =~ ^(\[[^\]]+\])(:([0-9]+))?$ ]]; then
+      p_host="${BASH_REMATCH[1]}"
+      p_port="${BASH_REMATCH[3]:-$PORT}"
+    elif [[ "$p_hostport" =~ ^(.+):+([0-9]+)$ ]]; then
+      p_host="${BASH_REMATCH[1]}"
+      while [[ "$p_host" == *: ]]; do p_host="${p_host%:}"; done
+      p_port="${BASH_REMATCH[2]}"
+    else
+      p_host="$p_hostport"
+      p_port="$PORT"
+    fi
+
+    # Skip if host is empty, starts with colon, or is just digits
+    if [[ -z "$p_host" || "$p_host" =~ ^:+ || "$p_host" =~ ^[0-9]+$ || "$p_host" == ":" ]]; then
+      continue
+    fi
+
+    target="${p_host}:${p_port}"
+    if [[ -n "$p_scheme" ]]; then
+      if [[ "$p_scheme" == "ws" || "$p_scheme" == "wss" ]]; then
+        peer_args+=("${p_scheme}://${target}/")
+      elif [[ "$p_scheme" == "quic" ]]; then
+        peer_args+=("quic://${target}" "tcp://${target}")
+      else
+        peer_args+=("${p_scheme}://${target}")
+      fi
+    else
+      case "$proto_lower" in
+        tcp)
+          peer_args+=("tcp://${target}")
+          ;;
+        ws)
+          peer_args+=("ws://${target}/")
+          ;;
+        wss)
+          peer_args+=("wss://${target}/")
+          ;;
+        quic)
+          peer_args+=("quic://${target}" "tcp://${target}")
+          ;;
+        faketcp)
+          peer_args+=("faketcp://${target}")
+          ;;
+        udp|icmp|pck)
+          peer_args+=("udp://${target}")
+          ;;
+        dual|*)
+          peer_args+=("tcp://${target}" "udp://${target}")
+          ;;
+      esac
+    fi
+  done
+  if ((${#peer_args[@]})); then
+    for p in "${peer_args[@]}"; do
+      args+=(--peers "$p")
+    done
+  fi
+fi
+
+# Ensure kernel IP forwarding is active
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+# Auto-allow Mesh Port in iptables and ufw if installed
+if command -v iptables >/dev/null 2>&1; then
+  iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  iptables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+fi
+# Invites can point other servers at this node's IPv6 address, so open the port there too.
+if [[ "${IPV6:-no}" == "yes" ]] && command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+  ip6tables -C INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  ufw allow "$PORT"/tcp >/dev/null 2>&1 || true
+  ufw allow "$PORT"/udp >/dev/null 2>&1 || true
+fi
+
+exec /opt/sutun/bin/easytier-core "${args[@]}"
+RUNNER
+  chmod 0755 "${INSTALL_DIR}/sutun-runner"
+}
+
+write_iperf_service() {
+  cat > "$IPERF_RUNNER" <<'RUNNER_IPERF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+config_file="/etc/sutun/config.env"
+mesh_ip=""
+if [[ -f "$config_file" ]]; then
+  mesh_ip="$( (grep -E '^IPV4=' "$config_file" 2>/dev/null || true) | cut -d= -f2- | tr -d '"'\'' ' )"
+fi
+
+# Wait for mesh virtual IP to be assigned to an interface (up to 20 seconds)
+if [[ -n "$mesh_ip" ]]; then
+  for _ in {1..20}; do
+    if ip addr show 2>/dev/null | grep -Fq "$mesh_ip"; then
+      break
+    fi
+    sleep 1
+  done
+  # Bind strictly to Mesh Virtual IP so port 5201 is NEVER exposed to public WAN
+  exec /usr/bin/iperf3 -s -B "$mesh_ip" -p 5201
+else
+  exec /usr/bin/iperf3 -s -p 5201
+fi
+RUNNER_IPERF
+  chmod 0755 "$IPERF_RUNNER"
+
+  cat > "$IPERF_SERVICE_FILE" <<EOF_IPERF_SVC
+[Unit]
+Description=SuTun iperf3 In-Mesh Speedtest Daemon
+Documentation=https://github.com/mdjes/SuTun
+PartOf=sutun.service
+After=network-online.target sutun.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${IPERF_RUNNER}
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+SyslogIdentifier=sutun-iperf
+
+[Install]
+WantedBy=multi-user.target
+EOF_IPERF_SVC
+
+  systemctl daemon-reload
+}
+
+apply_node_config() {
+  require_root
+  require_linux
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    fail "Configuration file not found: $CONFIG_FILE"
+    return 1
+  fi
+
+  # 1. Ensure core binary is installed and executable
+  if [[ ! -x "${BIN_DIR}/easytier-core" ]]; then
+    info "EasyTier core binary not found. Installing..."
+    install_core || { fail "Failed to install EasyTier core."; return 1; }
+  fi
+
+  # 2. Source configuration to get port and parameters
+  local port="11010"
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  port="${PORT:-11010}"
+
+  # 3. Ensure kernel IP forwarding and persistence
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  if [[ ! -f /etc/sysctl.d/99-sutun.conf ]]; then
+    echo "net.ipv4.ip_forward = 1" > /etc/sysctl.d/99-sutun.conf 2>/dev/null || true
+  fi
+
+  # 4. Whitelist firewall ports
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    iptables -C INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$port"/tcp >/dev/null 2>&1 || true
+    ufw allow "$port"/udp >/dev/null 2>&1 || true
+  fi
+
+  # 5. Write service file, runner, iperf service, and reload systemd
+  write_service
+
+  # 5b. Bring BackPack (ICMP/PCK) links up before EasyTier dials across them
+  if is_backpack_proto "${PROTOCOL:-}" || compgen -G "${ICMP_LINK_DIR}/*.env" >/dev/null; then
+    apply_icmp_links || warn "BackPack links need attention: journalctl -u 'sutun-icmp@*' -n 30"
+  fi
+
+  # 6. Enable systemd units on boot
+  systemctl enable sutun.service >/dev/null 2>&1 || true
+  systemctl enable sutun-iperf.service >/dev/null 2>&1 || true
+
+  # 7. Start or restart sutun.service
+  if systemctl is-active --quiet sutun.service; then
+    systemctl restart sutun.service
+  else
+    systemctl start sutun.service
+  fi
+
+  # 8. Start or restart sutun-iperf.service (isolated so it never blocks mesh)
+  if systemctl is-active --quiet sutun-iperf.service; then
+    systemctl restart sutun-iperf.service >/dev/null 2>&1 || true
+  else
+    systemctl start sutun-iperf.service >/dev/null 2>&1 || true
+  fi
+
+  # 9. Wait and verify service health
+  sleep 2
+  if systemctl is-active --quiet sutun.service; then
+    ok "The SuTun node is online and active."
+    return 0
+  else
+    fail "The SuTun node service failed to start."
+    journalctl -u sutun.service -n 25 --no-pager 2>/dev/null || true
+    return 1
+  fi
+}
+
+setup_node() {
+  require_root
+  [[ -x "${BIN_DIR}/easytier-core" ]] || install_core
+  header
+  section "CONFIGURE MESH NODE"
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    say "  How should this server join a mesh?" "$BOLD"
+    local s_mode=0
+    ui_choose s_mode 0 \
+      "Join an existing mesh with an invite code (xrmesh://)" \
+      "Create a new mesh network on this server" || return 0
+    if (( s_mode == 0 )); then
+      join_mesh_invite
+      return $?
+    fi
+    printf '\n'
+  fi
+
+  local name secret hostname ipv4 protocol port peers encryption ipv6 mtu enable_kcp multi_thread
+  local config_backup="" had_config=0 service_was_active=0
+  local default_name="sutun" default_secret="" default_hostname default_ipv4="10.144.144.1"
+  local default_protocol="dual" default_port="11010" default_peers=""
+  # EasyTier's own default MTU with encryption on is 1360; 1380 leaves too little room for its overhead.
+  local default_encryption="yes" default_ipv6="no" default_mtu="1360"
+  local default_enable_kcp="no" default_multi_thread="yes"
+  default_hostname="$(hostname -s)"
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    had_config=1
+    config_backup="$(mktemp)"
+    cp -p "$CONFIG_FILE" "$config_backup"
+    if systemctl is-active --quiet sutun.service; then
+      service_was_active=1
+    fi
+    # Preserve the current values while editing an existing node.
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    default_name="${NETWORK_NAME:-$default_name}"
+    default_secret="${NETWORK_SECRET:-}"
+    default_hostname="${HOSTNAME:-$default_hostname}"
+    default_ipv4="${IPV4:-$default_ipv4}"
+    default_protocol="${PROTOCOL:-$default_protocol}"
+    default_port="${PORT:-$default_port}"
+    default_peers="${PEERS:-}"
+    default_encryption="${ENCRYPTION:-$default_encryption}"
+    default_ipv6="${IPV6:-$default_ipv6}"
+    default_mtu="${MTU:-$default_mtu}"
+    default_enable_kcp="${ENABLE_KCP:-$default_enable_kcp}"
+    # Nodes created before multi-thread support ran single-threaded, so keep that unless changed here.
+    default_multi_thread="${MULTI_THREAD:-no}"
+    info "Editing the existing node. Press Enter to keep each current value."
+  fi
+
+  local _secret=""
+  ask name "Network name" "$default_name"
+  secret="${default_secret:-$(openssl rand -hex 16)}"
+  warn "All nodes MUST use exactly the same network name and network secret."
+  info "On the first node, keep the generated secret. Copy it to every other node."
+  if [[ -n "$default_secret" ]]; then
+    ask _secret "Shared network secret (Enter keeps the current one)"
+  else
+    ask _secret "Shared network secret (Enter generates one)"
+  fi
+  secret="${_secret:-$secret}"
+  if [[ -z "$default_secret" && -z "$_secret" ]]; then
+    printf '\n'
+    say "  ╭─ GENERATED NETWORK SECRET ──────────────────────────────────" "$YELLOW"
+    printf '  %b│%b  %b%s%b\n' "$YELLOW" "$RESET" "$BOLD$CYAN" "$secret" "$RESET"
+    say "  ╰─────────────────────────────────────────────────────────────" "$YELLOW"
+    warn "You must enter this exact secret on every other mesh node."
+    if [[ -t 0 ]]; then
+      printf '  %b╰─ Press Enter after you have saved the secret%b ' "$DIM$GRAY" "$RESET"
+      IFS= read -rs _ || true
+      printf '\n'
+    fi
+  fi
+  ask hostname "Node hostname" "$default_hostname"
+  while :; do
+    ask ipv4 "Virtual IPv4 address" "$default_ipv4"
+    valid_ip "$ipv4" && break
+    warn "Enter a valid address from the 10.x.x.x range."
+  done
+  local -a proto_ids=(dual udp tcp ws wss quic faketcp icmp pck)
+  local -a proto_labels=(
+    "dual      TCP + UDP listeners (recommended)"
+    "udp       UDP only"
+    "tcp       TCP only"
+    "ws        WebSocket"
+    "wss       WebSocket over TLS"
+    "quic      QUIC with TCP fallback"
+    "faketcp   FakeTCP (UDP disguised as TCP)"
+    "icmp      ICMP tunnel (BackPack xDi)"
+    "pck       Raw TCP tunnel (BackPack pck)"
+  )
+  local proto_pick=0 i
+  for i in "${!proto_ids[@]}"; do
+    [[ "${proto_ids[i]}" == "$default_protocol" ]] && proto_pick=$i
+  done
+  say "  Preferred protocol:" "$BOLD"
+  # Backing out of the picker keeps the current protocol.
+  ui_choose proto_pick "$proto_pick" "${proto_labels[@]}" || true
+  protocol="${proto_ids[proto_pick]}"
+  if is_backpack_proto "$protocol"; then
+    info "${protocol^^} links are created per server: run 'sutun invite' here and join from the other server."
+    [[ "$protocol" == "pck" ]] && info "PCK: create the invite on the server abroad and join from the server in Iran (Iran dials out)."
+    info "BackPack (Noise) encrypts each ${protocol^^} link, but servers that joined over links also reach each other"
+    info "directly over plain UDP. Answer 'no' to encryption below only if this mesh will have just two servers."
+    [[ "$default_mtu" == "1380" || "$default_mtu" == "1360" ]] && default_mtu="$ICMP_MESH_MTU"
+  elif [[ "$protocol" == "faketcp" ]]; then
+    info "FakeTCP links are made only to the peer addresses you enter; other servers may reach each other through them."
+  fi
+
+  while :; do
+    ask port "Mesh port" "$default_port"
+    valid_port "$port" && break
+    warn "The port must be between 1 and 65535."
+  done
+  ask peers "Peer addresses, comma-separated (empty for the first node)" "$default_peers"
+  ask_yes_no_into encryption "Enable encryption?" "$default_encryption"
+  ask_yes_no_into ipv6 "Enable IPv6?" "$default_ipv6"
+  while :; do
+    ask mtu "MTU" "$default_mtu"
+    valid_mtu "$mtu" && break
+    warn "The MTU must be between 576 and 9000."
+  done
+
+  ask_yes_no_into enable_kcp "Enable KCP loss-resistance proxy?" "$default_enable_kcp"
+  ask_yes_no_into multi_thread "Enable multi-thread mode (uses more than one CPU core)?" "$default_multi_thread"
+
+  # Applying the config, and restoring the previous one if it fails, must not be cut short.
+  printf '\n'
+  info "Applying the configuration. Ctrl+C is paused until this finishes."
+  trap '' INT
+  write_config "$name" "$secret" "$hostname" "$ipv4" "$protocol" "$port" "$peers" "$encryption" "$ipv6" "$mtu" "$enable_kcp" "$multi_thread"
+
+  if apply_node_config; then
+    info "Network: $name"
+    info "Virtual IP: $ipv4"
+    case "$protocol" in
+      wss)
+        info "Strict listener: wss://0.0.0.0:${port}"
+        ;;
+      quic)
+        info "QUIC listener with TCP fallback: quic://0.0.0.0:${port}"
+        ;;
+      ws)
+        info "WebSocket listener: ws://0.0.0.0:${port}"
+        ;;
+      faketcp)
+        info "FakeTCP listener: faketcp://0.0.0.0:${port}"
+        ;;
+      icmp)
+        info "ICMP mode: EasyTier listens on udp://0.0.0.0:${port} and peers over BackPack xDi links"
+        ;;
+      pck)
+        info "PCK mode: EasyTier listens on udp://0.0.0.0:${port} and peers over BackPack pck links"
+        ;;
+      tcp)
+        info "TCP-only listener: tcp://0.0.0.0:${port}"
+        ;;
+      udp)
+        info "UDP-only listener: udp://0.0.0.0:${port}"
+        ;;
+      dual|*)
+        info "Dual listeners: TCP and UDP on 0.0.0.0:${port}"
+        ;;
+    esac
+    warn "Keep this network secret private: $secret"
+  else
+    warn "Restoring the previous working node configuration."
+    systemctl stop sutun.service 2>/dev/null || true
+    if (( had_config )) && [[ -f "$config_backup" ]]; then
+      cp -p "$config_backup" "$CONFIG_FILE"
+      write_service
+      if (( service_was_active )); then
+        systemctl start sutun.service >/dev/null 2>&1 || true
+        systemctl start sutun-iperf.service >/dev/null 2>&1 || true
+      fi
+    else
+      systemctl disable sutun.service 2>/dev/null || true
+      rm -f "$CONFIG_FILE" "$SERVICE_FILE" "${INSTALL_DIR}/sutun-runner"
+      systemctl daemon-reload
+    fi
+    [[ -z "$config_backup" ]] || rm -f "$config_backup"
+    trap 'handle_interrupt' INT
+    return 1
+  fi
+  [[ -z "$config_backup" ]] || rm -f "$config_backup"
+  reapply_tunnels "The mesh is online, but "
+  trap 'handle_interrupt' INT
+}
+
+# Print this server's stable public IPv6, if it has one.
+get_server_ipv6() {
+  local ip6
+  ip6="$(ip -o -6 addr show scope global 2>/dev/null |
+    awk '$2 !~ /^(easytier|tun|tap|docker|br-|veth|wg|lo|xrmi)/ && !/deprecated/ && !/temporary/ { split($4, a, "/"); print a[1] }' |
+    grep -viE '^f[cd]' | head -n1 || true)"
+  [[ -n "$ip6" ]] || ip6="$(curl -6 -s --connect-timeout 2 --max-time 3 https://api6.ipify.org 2>/dev/null || true)"
+  [[ "$ip6" == *:* && "$ip6" =~ ^[0-9A-Fa-f:]+$ ]] && printf '%s\n' "$ip6"
+  return 0
+}
+
+show_mesh_invite() {
+  require_root
+  require_linux
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    fail "Mesh node is not configured yet. Configure the node or join a mesh first."
+    pause
+    return 1
+  fi
+
+  # Optional: --ipv4 or --ipv6 picks the address family without asking.
+  local family_arg="${1:-}"
+
+  header
+  section "MESH INVITE CODE"
+
+  local net secret proto port pub_ip pub_ip6="" invite_code mtu kcp enc ipv6
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE" 2>/dev/null || true
+  net="${NETWORK_NAME:-sutun}"
+  secret="${NETWORK_SECRET:-}"
+  proto="${PROTOCOL:-dual}"
+  port="${PORT:-11010}"
+  mtu="${MTU:-1380}"
+  kcp="${ENABLE_KCP:-no}"
+  enc="${ENCRYPTION:-yes}"
+  ipv6="${IPV6:-no}"
+  pub_ip="$(get_server_ip)"
+
+  if [[ -z "$secret" ]]; then
+    fail "Current node has no network secret configured."
+    pause
+    return 1
+  fi
+
+  local endpoint="${pub_ip}:${port}" family="IPv4"
+  # EasyTier adds [::] listeners except for FakeTCP, and BackPack links are IPv4-only.
+  if [[ "$ipv6" == "yes" && "$proto" != "faketcp" ]] && ! is_backpack_proto "$proto"; then
+    pub_ip6="$(get_server_ipv6)"
+  fi
+  if [[ -n "$pub_ip6" ]]; then
+    local pick="1"
+    if [[ "$family_arg" == "--ipv6" || -z "$pub_ip" ]]; then
+      pick="2"
+    elif [[ -z "$family_arg" && -t 0 ]]; then
+      say "  Which address should other servers use to reach this one?" "$BOLD"
+      local family_pick=0
+      ui_choose family_pick 0 "IPv4  ${pub_ip}" "IPv6  ${pub_ip6}" || return 0
+      pick=$(( family_pick + 1 ))
+      printf '\n'
+    fi
+    if [[ "$pick" == "2" ]]; then
+      endpoint="[${pub_ip6}]:${port}"
+      family="IPv6"
+    fi
+  fi
+
+  local icmp_link="" link_key="" joined_via=""
+  if is_backpack_proto "$proto"; then
+    joined_via="$(backpack_joined_via)"
+    if [[ -n "$joined_via" ]]; then
+      warn "This server joined the mesh over a ${proto^^} link through ${joined_via}."
+      warn "Create the code for the next server there: run 'sutun invite' on ${joined_via}."
+      if [[ -t 0 ]]; then
+        if ! ask_yes_no "Create a code on this server anyway? The next server would connect through this one." no; then
+          return 0
+        fi
+      fi
+    fi
+    # Every invite carries one BackPack link; it is reused until a server has actually joined on it.
+    icmp_link="$(ensure_icmp_listen_link "$(backpack_carrier_for_proto "$proto")" | tail -n1)"
+    if [[ "$icmp_link" != "{"* ]]; then
+      fail "Could not prepare a ${proto^^} link for this invite."
+      pause
+      return 1
+    fi
+    link_key="$(invite_link_key "$proto")"
+    (( mtu > ICMP_MESH_MTU )) && mtu="$ICMP_MESH_MTU"
+  fi
+  invite_code="$(python3 -c "import sys, json, base64
+a = sys.argv
+d = {
+    'v': 2,
+    'net': a[1],
+    'secret': a[2],
+    'endpoint': a[3],
+    'proto': a[4],
+    'port': int(a[5]),
+    'enc': a[6] != 'no',
+    'kcp': a[7] == 'yes',
+    'ipv6': a[8] == 'yes',
+    'mtu': int(a[9]),
+}
+if a[10]:
+    d[a[11]] = json.loads(a[10])
+token = base64.b64encode(json.dumps(d).encode('utf-8')).decode('utf-8')
+print(f'xrmesh://{token}')
+" "$net" "$secret" "$endpoint" "$proto" "$port" "$enc" "$kcp" "$ipv6" "$mtu" "$icmp_link" "$link_key" 2>/dev/null || true)"
+
+  ok "Generated a mesh invite code for this server."
+  printf '\n'
+  say "  ╭─ INVITE CODE (copy the whole line) ─────────────────────────" "$DIM$BLUE"
+  # The code sits on its own line, without box characters, so it copies cleanly.
+  printf '\n  %b%s%b\n\n' "$BOLD$GREEN" "$invite_code" "$RESET"
+  say "  ├─ Settings this code applies on the joining server ──────────" "$DIM$BLUE"
+  ui_kv "Network name" "$net"
+  ui_kv "Protocol" "$proto"
+  ui_kv "Peer endpoint" "${endpoint} (${family})"
+  ui_kv "Mesh port" "$port"
+  ui_kv "MTU" "$mtu"
+  ui_kv "KCP" "$kcp"
+  ui_kv "Encryption" "$enc"
+  ui_kv "IPv6" "$ipv6"
+  say "  ╰─────────────────────────────────────────────────────────────" "$DIM$BLUE"
+  printf '\n'
+  info "On another server, run 'sutun join' and paste this code to connect instantly."
+
+  if is_backpack_proto "$proto"; then
+    say "  How ${proto^^} links work:" "$BOLD$YELLOW"
+    [[ -z "$joined_via" ]] && say "   • This server is the main server; every other server joins with a code from here." "$YELLOW"
+    say "   • One code connects ONE server. Paste it with 'sutun join' on that server." "$YELLOW"
+    say "   • Once it shows up in 'sutun peers', run 'sutun invite' again for the next server." "$YELLOW"
+    if [[ "$proto" == "pck" ]]; then
+      local pck_port
+      pck_port="$(python3 -c 'import sys, json; print(json.loads(sys.argv[1])["p"])' "$icmp_link" 2>/dev/null || true)"
+      say "   • The joining server dials this one on TCP port ${pck_port:-?}: open it in the provider's firewall." "$YELLOW"
+      say "   • Run this on the server abroad and join from the server in Iran." "$YELLOW"
+    fi
+    if [[ "$enc" != "no" ]]; then
+      info "BackPack encrypts each ${proto^^} link, but servers that joined over links also reach each other"
+      info "directly over plain UDP. Turn off mesh encryption only if this mesh will have just two servers."
+    fi
+  fi
+  pause
+}
+
+# Decode an invite code into one normalized value per line, following the same rules as
+# decode_invite_token() in web/server.py. Prints nothing when the code cannot be read.
+decode_invite_fields() {
+  python3 - "$1" <<'PY_DECODE' 2>/dev/null || true
+import base64, json, re, sys
+raw = re.sub("[​-‏‪-‮⁦-⁩﻿]", "", sys.argv[1]).strip().strip("\"'")
+token = re.sub(r"^.*?xrmesh://", "", raw, flags=re.I).strip()
+token = re.sub(r"\s+", "", token).replace("-", "+").replace("_", "/").rstrip("=")
+token += "=" * (-len(token) % 4)
+try:
+    d = json.loads(base64.b64decode(token).decode("utf-8"))
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict):
+    sys.exit(1)
+endpoint = str(d.get("endpoint") or "").strip()
+m = re.fullmatch(r"\[?([^\[\]]+?)\]?:(\d{1,5})", endpoint)
+proto = str(d.get("proto") or "dual").strip().lower()
+if proto not in ("dual", "udp", "tcp", "ws", "wss", "quic", "faketcp", "icmp", "pck"):
+    proto = "dual"
+
+def num(key, lo, hi):
+    v = d.get(key)
+    return v if isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi else None
+
+def flag(key, default):
+    v = d.get(key)
+    return ("yes" if v else "no") if isinstance(v, bool) else default
+
+host = m.group(1) if m else ""
+# ICMP codes carry their BackPack link as "icmp" (kept for older joiners); other carriers as "link".
+link = d.get("link") if isinstance(d.get("link"), dict) else d.get("icmp")
+link = link if isinstance(link, dict) else {}
+for value in (
+    str(d.get("net") or "").strip(),
+    str(d.get("secret") or "").strip(),
+    proto,
+    endpoint,
+    host,
+    m.group(2) if m else "",
+    num("port", 1, 65535) or (int(m.group(2)) if m else 11010),
+    num("mtu", 576, 9000) or 1380,
+    flag("kcp", "no"),
+    flag("enc", "yes"),
+    "yes" if ":" in host else flag("ipv6", "no"),
+    link.get("t", ""),
+    link.get("p", ""),
+    link.get("i", ""),
+):
+    print(value)
+PY_DECODE
+}
+
+join_mesh_invite() {
+  require_root
+  require_linux
+  [[ -x "${BIN_DIR}/easytier-core" ]] || install_core
+
+  header
+  section "JOIN MESH VIA INVITE CODE"
+  info "Paste an invite code (xrmesh://...) from another server to join its mesh overlay."
+  printf '\n'
+
+  local raw_invite="${1:-}"
+  if [[ -z "$raw_invite" ]]; then
+    ask raw_invite "Paste the invite code (xrmesh://...)"
+  fi
+  raw_invite="${raw_invite#"${raw_invite%%[![:space:]]*}"}"
+  raw_invite="${raw_invite%"${raw_invite##*[![:space:]]}"}"
+
+  if [[ -z "$raw_invite" ]]; then
+    fail "No invite code provided."
+    pause
+    return 1
+  fi
+
+  local -a fields=()
+  mapfile -t fields < <(decode_invite_fields "$raw_invite")
+  if (( ${#fields[@]} < 14 )); then
+    fail "Invalid invite code format. Make sure you copied the complete 'xrmesh://...' link."
+    pause
+    return 1
+  fi
+
+  local net="${fields[0]}" secret="${fields[1]}" proto="${fields[2]}" endpoint="${fields[3]}"
+  local peer_host="${fields[4]}" peer_port="${fields[5]}" invite_port="${fields[6]}" mtu_val="${fields[7]}"
+  local kcp_val="${fields[8]}" enc_val="${fields[9]}" ipv6_val="${fields[10]}"
+  local icmp_token="${fields[11]}" icmp_port="${fields[12]}" icmp_idx="${fields[13]}"
+
+  if [[ -z "$net" || -z "$secret" ]]; then
+    fail "The invite code is missing essential network credentials."
+    pause
+    return 1
+  fi
+  if is_backpack_proto "$proto" && (( mtu_val > ICMP_MESH_MTU )); then
+    mtu_val="$ICMP_MESH_MTU"
+  fi
+
+  printf '\n'
+  say "  ╭─ MESH FROM THIS INVITE ─────────────────────────────────────" "$DIM$BLUE"
+  ui_kv "Network name" "$net" "$BOLD$CYAN"
+  ui_kv "Protocol" "$proto" "$BOLD$CYAN"
+  ui_kv "Peer endpoint" "${endpoint:-Relayed Peer}" "$BOLD$GREEN"
+  ui_kv "Mesh port" "$invite_port"
+  ui_kv "MTU" "$mtu_val"
+  ui_kv "KCP" "$kcp_val"
+  ui_kv "Encryption" "$enc_val"
+  ui_kv "IPv6" "$ipv6_val"
+  say "  ╰─────────────────────────────────────────────────────────────" "$DIM$BLUE"
+  if is_backpack_proto "$proto"; then
+    info "This code creates a ${proto^^} link to ${peer_host:-the other server} and works for this server only."
+  fi
+  printf '\n'
+
+  local default_hostname default_ipv4 multi_thread="yes"
+  default_hostname="$(hostname -s 2>/dev/null || echo "node")"
+
+  # Generate suggested random IP in 10.144.144.2 - 254
+  local rand_host=$(( (RANDOM % 240) + 10 ))
+  default_ipv4="10.144.144.${rand_host}"
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE" 2>/dev/null || true
+    [[ -n "${IPV4:-}" && "$IPV4" != "10.144.144.1" ]] && default_ipv4="$IPV4"
+    [[ -n "${HOSTNAME:-}" ]] && default_hostname="$HOSTNAME"
+    # Multi-thread is this server's own setting, so it survives joining another mesh.
+    multi_thread="${MULTI_THREAD:-no}"
+  fi
+
+  local hostname ipv4 port
+  ask hostname "Node hostname" "$default_hostname"
+
+  while :; do
+    ask ipv4 "Virtual IPv4 in the mesh" "$default_ipv4"
+    valid_ip "$ipv4" && break
+    warn "Enter a valid address from the private IP range (e.g. 10.144.144.x)."
+  done
+
+  # The invite carries the mesh port, so every server listens on the same one by default.
+  while :; do
+    ask port "Mesh listen port" "$invite_port"
+    valid_port "$port" && break
+    warn "The port must be between 1 and 65535."
+  done
+
+  local peers_val="$endpoint"
+
+  if is_backpack_proto "$proto"; then
+    local link_json peer_ip
+    if [[ -z "$peer_host" || -z "$icmp_token" ]]; then
+      fail "This ${proto^^} invite has no link details. Generate a new invite on the other server."
+      pause
+      return 1
+    fi
+    info "Creating the ${proto^^} link to ${peer_host}..."
+    link_json="$(create_icmp_dial_link "$peer_host" "$icmp_port" "$icmp_token" "$icmp_idx" "$(backpack_carrier_for_proto "$proto")" | tail -n1)"
+    peer_ip="$(python3 -c 'import sys, json; print(json.loads(sys.argv[1])["peer_ip"])' "$link_json" 2>/dev/null || true)"
+    if [[ -z "$peer_ip" ]]; then
+      fail "The ${proto^^} link could not be created."
+      pause
+      return 1
+    fi
+    # EasyTier reaches the other server through the BackPack link, not its public address.
+    peers_val="udp://${peer_ip}:${peer_port}"
+  fi
+
+  info "Connecting to mesh '${net}'. Ctrl+C is paused until this finishes."
+  # Writing the config and starting the node must not be cut short halfway.
+  trap '' INT
+  write_config "$net" "$secret" "$hostname" "$ipv4" "$proto" "$port" "$peers_val" "$enc_val" "$ipv6_val" "$mtu_val" "$kcp_val" "$multi_thread"
+
+  local joined=0
+  if apply_node_config; then
+    prune_icmp_links
+    systemctl restart sutun-web.service >/dev/null 2>&1 || true
+    joined=1
+  fi
+  trap 'handle_interrupt' INT
+  if (( joined )); then
+    ok "Joined mesh '${net}' as ${hostname} (${ipv4})."
+    info "Open 'Live status & peers' in the menu, or run 'sutun peers', to see the other servers."
+  else
+    fail "The mesh service did not start. Check the logs: journalctl -u sutun.service -n 30"
+  fi
+  pause
+  (( joined ))
+}
+
+
+delete_mesh_noninteractive() {
+  require_root
+  systemctl disable --now sutun.service 2>/dev/null || true
+  systemctl disable --now sutun-haproxy.service 2>/dev/null || true
+  systemctl disable --now sutun-iptables.service 2>/dev/null || true
+  systemctl disable --now sutun-gost.service 2>/dev/null || true
+  systemctl disable --now sutun-realm.service 2>/dev/null || true
+  if [[ -x "$IPTABLES_APPLY_SCRIPT" ]]; then
+    "$IPTABLES_APPLY_SCRIPT" remove >/dev/null 2>&1 || true
+  fi
+  # BackPack (ICMP/PCK) links pair this node with specific servers, so they go with the mesh configuration.
+  remove_all_icmp_links
+  rm -f "$SERVICE_FILE" "$CONFIG_FILE" "${INSTALL_DIR}/sutun-runner"
+  systemctl daemon-reload
+  systemctl reset-failed sutun.service 2>/dev/null || true
+  ok "The mesh node and its configuration have been deleted."
+}
+
+delete_mesh() {
+  header
+  section "DELETE MESH CONFIGURATION"
+  if [[ ! -f "$CONFIG_FILE" && ! -f "$SERVICE_FILE" ]]; then
+    warn "No mesh configuration exists on this server."
+    pause
+    return
+  fi
+
+  warn "This will stop the node and delete its mesh configuration."
+  info "SuTun and EasyTier binaries will remain installed."
+  local confirm
+  ask confirm "Type DELETE to confirm"
+  if [[ "$confirm" != "DELETE" ]]; then
+    info "Delete cancelled. Nothing was changed."
+    return 0
+  fi
+
+  compgen -G "${HAPROXY_TUNNEL_DIR}/*.env" >/dev/null &&
+    info "HAProxy tunnels were disabled and preserved for the next mesh configuration."
+  compgen -G "${IPTABLES_TUNNEL_DIR}/*.env" >/dev/null &&
+    info "iptables tunnels were disabled and preserved for the next mesh configuration."
+  compgen -G "${GOST_TUNNEL_DIR}/*.env" >/dev/null &&
+    info "GOST tunnels were disabled and preserved for the next mesh configuration."
+  compgen -G "${REALM_TUNNEL_DIR}/*.env" >/dev/null &&
+    info "Realm tunnels were disabled and preserved for the next mesh configuration."
+
+  delete_mesh_noninteractive
+  info "Select option 1 whenever you want to create a new mesh node."
+  pause
+}
+
+service_state() {
+  if systemctl is-active --quiet sutun.service 2>/dev/null; then
+    printf '%b● ONLINE%b' "$GREEN" "$RESET"
+  elif [[ -f "$SERVICE_FILE" ]]; then
+    printf '%b● OFFLINE%b' "$RED" "$RESET"
+  else
+    printf '%b○ NOT CONFIGURED%b' "$GRAY" "$RESET"
+  fi
+}
+
+server_addresses() {
+  local family="$1"
+  ip -o "-${family}" addr show scope global 2>/dev/null |
+    awk '{print $2, $4}' |
+    awk '$1 !~ /^(easytier|tun|tap|docker|br-|veth)/ {print $2}' |
+    cut -d/ -f1 |
+    paste -sd ', ' -
+}
+
+render_network_overview() {
+  section "NETWORK OVERVIEW"
+  printf '  %-16s %s\n' "Service" "$(service_state)"
+  if [[ -f "${INSTALL_DIR}/easytier.version" ]]; then
+    printf '  %-16s %b%s%b\n' "EasyTier" "$GREEN" "$(cat "${INSTALL_DIR}/easytier.version")" "$RESET"
+  fi
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    printf '  %-16s %b%s%b\n' "Node" "$BOLD$CYAN" "$HOSTNAME" "$RESET"
+    printf '  %-16s %b%s%b\n' "Virtual IP" "$CYAN" "$IPV4" "$RESET"
+    printf '  %-16s %b%s%b\n' "Network" "$PURPLE" "$NETWORK_NAME" "$RESET"
+    case "${PROTOCOL:-dual}" in
+      wss)
+        printf '  %-16s %b%s only%b\n' "Transport" "$YELLOW" "WSS" "$RESET"
+        ;;
+      quic)
+        printf '  %-16s %b%s (TCP fallback)%b\n' "Transport" "$PURPLE" "QUIC" "$RESET"
+        ;;
+      ws)
+        printf '  %-16s %b%s%b\n' "Transport" "$CYAN" "WebSocket (ws)" "$RESET"
+        ;;
+      faketcp)
+        printf '  %-16s %b%s%b\n' "Transport" "$RED" "FakeTCP" "$RESET"
+        ;;
+      icmp)
+        printf '  %-16s %b%s%b\n' "Transport" "$PINK" "ICMP (BackPack xDi)" "$RESET"
+        ;;
+      pck)
+        printf '  %-16s %b%s%b\n' "Transport" "$PINK" "PCK (BackPack raw TCP)" "$RESET"
+        ;;
+      tcp)
+        printf '  %-16s %b%s only%b\n' "Transport" "$BLUE" "TCP" "$RESET"
+        ;;
+      udp)
+        printf '  %-16s %b%s only%b\n' "Transport" "$GREEN" "UDP" "$RESET"
+        ;;
+      dual|*)
+        printf '  %-16s %bDual (TCP + UDP)%b\n' "Transport" "$GREEN" "$RESET"
+        ;;
+    esac
+  else
+    printf '\n'
+  fi
+  local server_ipv4 server_ipv6
+  server_ipv4="$(server_addresses 4)"
+  server_ipv6="$(server_addresses 6)"
+  printf '  %-16s %b%s%b\n' "Server IPv4" "$BLUE" "${server_ipv4:-not detected}" "$RESET"
+  if [[ -n "$server_ipv6" ]]; then
+    printf '  %-16s %b%s%b\n' "Server IPv6" "$BLUE" "$server_ipv6" "$RESET"
+  fi
+}
+
+render_connected_peers() {
+  section "CONNECTED PEERS"
+  if systemctl is-active --quiet sutun.service && [[ -x "${BIN_DIR}/easytier-cli" ]]; then
+    "${BIN_DIR}/easytier-cli" peer 2>/dev/null || warn "Could not retrieve peer information."
+  else
+    warn "Configure and start a node to display its peers."
+  fi
+}
+
+render_peer_snapshot() {
+  section "PEER SNAPSHOT"
+  if ! systemctl is-active --quiet sutun.service 2>/dev/null ||
+     [[ ! -x "${BIN_DIR}/easytier-cli" ]]; then
+    warn "Peer information is unavailable while the mesh node is offline."
+    return
+  fi
+
+  local output rows summary count latency rx tx
+  output="$("${BIN_DIR}/easytier-cli" -p 127.0.0.1:15888 -o json peer 2>/dev/null ||
+    "${BIN_DIR}/easytier-cli" -o json peer 2>/dev/null || true)"
+  if [[ -z "$output" ]]; then
+    warn "Could not retrieve the EasyTier peer snapshot."
+    return
+  fi
+
+  rows="$(printf '%s\n' "$output" | jq -r '
+    .. | objects |
+    select(.cost? != null and .cost != "Local" and (.ipv4? // "") != "") |
+    [.ipv4, (.lat_ms // "0"), (.rx_bytes // "0 B"), (.tx_bytes // "0 B")] |
+    @tsv
+  ' 2>/dev/null || true)"
+
+  summary="$(printf '%s\n' "$rows" | awk -F'\t' '
+    function to_bytes(value, parts, number, unit) {
+      if (value == "" || value == "*") return 0
+      split(value, parts, /[ \t]+/)
+      number=parts[1]+0
+      unit=tolower(parts[2])
+      if (unit == "kb") return number*1000
+      if (unit == "mb") return number*1000*1000
+      if (unit == "gb") return number*1000*1000*1000
+      if (unit == "tb") return number*1000*1000*1000*1000
+      if (unit == "kib") return number*1024
+      if (unit == "mib") return number*1024*1024
+      if (unit == "gib") return number*1024*1024*1024
+      if (unit == "tib") return number*1024*1024*1024*1024
+      return number
+    }
+    function human(value) {
+      if (value >= 1099511627776) return sprintf("%.2f TB", value/1099511627776)
+      if (value >= 1073741824) return sprintf("%.2f GB", value/1073741824)
+      if (value >= 1048576) return sprintf("%.2f MB", value/1048576)
+      if (value >= 1024) return sprintf("%.2f KB", value/1024)
+      return sprintf("%.0f B", value)
+    }
+    {
+      ip=$1
+      if (ip == "" || seen[ip]++) next
+      count++
+      current_latency=$2
+      if (current_latency ~ /^[0-9]+([.][0-9]+)?$/) {
+        latency_total+=current_latency
+        latency_count++
+      }
+      rx_total+=to_bytes($3)
+      tx_total+=to_bytes($4)
+    }
+    END {
+      average=(latency_count ? sprintf("%.1f ms", latency_total/latency_count) : "n/a")
+      printf "%d|%s|%s|%s", count+0, average, human(rx_total), human(tx_total)
+    }
+  ')"
+  IFS='|' read -r count latency rx tx <<< "$summary"
+
+  printf '  %-18s %b%s online%b\n' "Connected peers" "$BOLD$GREEN" "${count:-0}" "$RESET"
+  printf '  %-18s %b%s%b\n' "Average latency" "$CYAN" "${latency:-n/a}" "$RESET"
+  printf '  %-18s %b%s%b\n' "Total traffic" "$BLUE" "RX ${rx:-0 B} / TX ${tx:-0 B}" "$RESET"
+  printf '  %-18s %s\n' "Last check" "$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '%b  Open Live Status for the complete real-time peer table.%b\n' "$DIM$GRAY" "$RESET"
+}
+
+dashboard() {
+  header
+  render_network_overview
+  render_peer_snapshot
+}
+
+restore_live_terminal() {
+  # Line wrap, the cursor, and the screen that was active before Live Status.
+  printf '\033[?7h\033[?25h\033[?1049l'
+}
+
+live_status() {
+  [[ -x "${BIN_DIR}/easytier-cli" ]] || { warn "EasyTier is not installed."; pause; return; }
+  if ! ui_interactive; then
+    dashboard
+    return
+  fi
+
+  local frame key_status
+  # The alternate screen keeps Live Status out of the terminal history, and with
+  # line wrap off a wide peer table is cut at the edge instead of breaking the redraw.
+  printf '\033[?1049h\033[?25l\033[?7l'
+  on_cancel restore_live_terminal
+  CANCEL_NOTE=""
+
+  header
+  section "LIVE STATUS"
+  printf '%b  Refreshes every second · press q, Esc or Ctrl+C to go back%b\n' "$DIM$GRAY" "$RESET"
+  # Save the beginning of the dynamic area. It can be restored repeatedly.
+  printf '\033[s'
+
+  while true; do
+    frame="$(
+      render_network_overview
+      render_connected_peers
+      printf '\n  %b● LIVE%b  %s\n' "$GREEN" "$RESET" "$(date '+%H:%M:%S')"
+    )"
+
+    # Restore the dynamic origin, write the complete frame in one operation,
+    # then remove stale lines left by a previously larger peer table.
+    printf '\033[u%s\n\033[J' "$frame"
+
+    key_status=0
+    ui_read_key || key_status=$?
+    case $key_status in
+      1) break ;;
+      2) continue ;;
+    esac
+    case "$UI_KEY" in
+      q|Q|esc) break ;;
+    esac
+  done
+
+  restore_live_terminal
+  # Everything was drawn on the alternate screen, so there is nothing left to read.
+  UI_PAUSED=1
+}
+
+
+show_routes() {
+  header
+  say "  Network Routes" "$BOLD$CYAN"
+  "${BIN_DIR}/easytier-cli" route 2>/dev/null || warn "The routing table is unavailable."
+  printf '\n'; pause
+}
+
+show_logs() {
+  header
+  say "  Live SuTun Logs — press Ctrl+C to return" "$BOLD$CYAN"
+  journalctl -u sutun.service -f -n 80 -o short-iso
+}
+
+diagnostics() {
+  header
+  say "  Connection Diagnostics" "$BOLD$CYAN"
+  printf '\n'
+
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    fail "SuTun is not configured on this server."
+    pause
+    return
+  fi
+
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  printf '  Service:       %s\n' "$(service_state)"
+  printf '  Network name:  %s\n' "$NETWORK_NAME"
+  printf '  Virtual IP:    %s\n' "$IPV4"
+  case "${PROTOCOL:-dual}" in
+    wss)
+      printf '  Transport:     WSS only (strict)\n'
+      printf '  Listen port:   %s/WSS\n' "$PORT"
+      ;;
+    quic)
+      printf '  Transport:     QUIC (with TCP fallback)\n'
+      printf '  Listen port:   %s (QUIC + TCP)\n' "$PORT"
+      ;;
+    ws)
+      printf '  Transport:     WebSocket (ws)\n'
+      printf '  Listen port:   %s/WS\n' "$PORT"
+      ;;
+    faketcp)
+      printf '  Transport:     FakeTCP\n'
+      printf '  Listen port:   %s/FakeTCP\n' "$PORT"
+      ;;
+    icmp)
+      printf '  Transport:     ICMP (EasyTier over BackPack xDi links)\n'
+      printf '  Listen port:   %s/UDP (reached through the ICMP links)\n' "$PORT"
+      ;;
+    pck)
+      printf '  Transport:     PCK (EasyTier over BackPack pck links)\n'
+      printf '  Listen port:   %s/UDP (reached through the PCK links)\n' "$PORT"
+      ;;
+    tcp)
+      printf '  Transport:     TCP only\n'
+      printf '  Listen port:   %s/TCP\n' "$PORT"
+      ;;
+    udp)
+      printf '  Transport:     UDP only\n'
+      printf '  Listen port:   %s/UDP\n' "$PORT"
+      ;;
+    dual|*)
+      printf '  Transport:     Dual (TCP + UDP)\n'
+      printf '  Listen port:   %s (TCP + UDP)\n' "$PORT"
+      ;;
+  esac
+  printf '  Configured peers: %s\n\n' "${PEERS:-none — first/standalone node}"
+
+  say "  ── Local listeners ──────────────────────────" "$GRAY"
+  ss -lntup 2>/dev/null | grep -E "(:${PORT}[[:space:]])|easytier" || warn "No EasyTier listener was found on port ${PORT}."
+
+  printf '\n'
+  say "  ── EasyTier peer center ─────────────────────" "$GRAY"
+  "${BIN_DIR}/easytier-cli" -p 127.0.0.1:15888 peer-center 2>/dev/null ||
+    "${BIN_DIR}/easytier-cli" peer-center 2>/dev/null ||
+    warn "peer-center is unavailable."
+
+  printf '\n'
+  say "  ── Recent connection messages ───────────────" "$GRAY"
+  journalctl -u sutun.service -n 120 --no-pager 2>/dev/null |
+    grep -Ei 'peer|connect|handshake|secret|network|error|warn|refused|timeout' |
+    tail -n 30 || warn "No relevant connection messages were found."
+
+  printf '\n'
+  warn "Verify that BOTH servers use the exact same network name and secret."
+  if [[ "$PROTOCOL" == "wss" ]]; then
+    warn "Open TCP port ${PORT} in UFW and the VPS provider firewall for WSS."
+  elif [[ "$PROTOCOL" == "quic" ]]; then
+    warn "Open UDP port ${PORT} in UFW and the VPS provider firewall for QUIC."
+  elif [[ "$PROTOCOL" == "icmp" ]]; then
+    list_icmp_links
+    warn "ICMP echo (ping) must reach the listening server. Link logs: journalctl -u 'sutun-icmp@*' -n 30"
+  elif [[ "$PROTOCOL" == "pck" ]]; then
+    list_icmp_links
+    warn "The PCK link's TCP port must be open in the listening server's provider firewall. Link logs: journalctl -u 'sutun-icmp@*' -n 30"
+  else
+    warn "Open TCP and UDP port ${PORT} in UFW and the VPS provider firewall."
+  fi
+  pause
+}
+
+validate_tunnel_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,31}$ ]]
+}
+
+expand_port_token() {
+  local token="$1" output_name="$2" start end port
+  local -n output_ref="$output_name"
+  output_ref=()
+
+  if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+    start="${BASH_REMATCH[1]}"
+    end="${BASH_REMATCH[2]}"
+    (( start >= 1 && end <= 65535 && start <= end )) || return 1
+    (( end - start <= 255 )) || return 1
+    for ((port=start; port<=end; port++)); do output_ref+=("$port"); done
+  elif valid_port "$token"; then
+    output_ref+=("$token")
+  else
+    return 1
+  fi
+}
+
+# Expand a port specification into "listen_port<TAB>target_port" pairs.
+# Backward-compatible forms keep the same port on both sides:
+#   443                 -> 443 -> 443
+#   80,443,8000-8002    -> same-port mappings
+# Port mapping forms use LISTEN:TARGET:
+#   1234:443            -> 1234 -> 443
+#   1000-1002:2000-2002 -> pairwise range mapping
+#   1000-1002:443       -> all three listen ports -> 443
+expand_port_mappings() {
+  local spec="${1//[[:space:]]/}" item listen_token target_token idx listen_port target_port
+  local -a items=() listen_ports=() target_ports=()
+  local -A seen_target=()
+  local count=0
+
+  [[ -n "$spec" ]] || return 1
+  IFS=',' read -ra items <<< "$spec"
+  for item in "${items[@]}"; do
+    [[ -n "$item" ]] || return 1
+
+    if [[ "$item" == *:* ]]; then
+      [[ "$item" =~ ^([^:]+):([^:]+)$ ]] || return 1
+      listen_token="${BASH_REMATCH[1]}"
+      target_token="${BASH_REMATCH[2]}"
+    else
+      listen_token="$item"
+      target_token="$item"
+    fi
+
+    expand_port_token "$listen_token" listen_ports || return 1
+    expand_port_token "$target_token" target_ports || return 1
+
+    if ((${#target_ports[@]} != 1 && ${#target_ports[@]} != ${#listen_ports[@]})); then
+      return 1
+    fi
+
+    for ((idx=0; idx<${#listen_ports[@]}; idx++)); do
+      listen_port="${listen_ports[$idx]}"
+      if ((${#target_ports[@]} == 1)); then
+        target_port="${target_ports[0]}"
+      else
+        target_port="${target_ports[$idx]}"
+      fi
+
+      if [[ -n "${seen_target[$listen_port]:-}" ]]; then
+        [[ "${seen_target[$listen_port]}" == "$target_port" ]] || return 1
+        continue
+      fi
+
+      seen_target["$listen_port"]="$target_port"
+      ((count+=1))
+      (( count <= 256 )) || return 1
+      printf '%s\t%s\n' "$listen_port" "$target_port"
+    done
+  done
+
+  (( count > 0 ))
+}
+
+# Compatibility helper used by collision checks: emit only inbound/listen ports.
+expand_port_spec() {
+  local mappings listen_port target_port
+  mappings="$(expand_port_mappings "$1")" || return 1
+  while IFS=$'\t' read -r listen_port target_port; do
+    [[ -n "$listen_port" ]] && printf '%s\n' "$listen_port"
+  done <<< "$mappings"
+}
+
+discover_mesh_nodes() {
+  [[ -x "${BIN_DIR}/easytier-cli" ]] || return 0
+  local local_ip="" output normalized ip host json_rows
+  local -A seen=()
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local_ip="$(sed -n 's/^IPV4=//p' "$CONFIG_FILE" | head -n1)"
+  fi
+
+  output="$("${BIN_DIR}/easytier-cli" -p 127.0.0.1:15888 -o json peer 2>/dev/null ||
+    "${BIN_DIR}/easytier-cli" -o json peer 2>/dev/null || true)"
+  [[ -n "$output" ]] || return 0
+
+  if command -v jq >/dev/null 2>&1; then
+    json_rows="$(printf '%s\n' "$output" | jq -r '
+      .. | objects |
+      select(.cost? != null and .cost != "Local" and (.ipv4? // "") != "") |
+      [(.ipv4 // ""), (.hostname // "EasyTier peer")] |
+      @tsv
+    ' 2>/dev/null || true)"
+    while IFS=$'\t' read -r ip host; do
+      [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+      [[ "$ip" == "$local_ip" || -n "${seen[$ip]:-}" ]] && continue
+      seen["$ip"]=1
+      printf '%s|%s\n' "$ip" "${host:-EasyTier peer}"
+    done <<< "$json_rows"
+    ((${#seen[@]})) && return 0
+  fi
+
+  # Compatibility fallback for EasyTier versions without JSON output.
+  output="$("${BIN_DIR}/easytier-cli" -p 127.0.0.1:15888 peer 2>/dev/null ||
+    "${BIN_DIR}/easytier-cli" peer 2>/dev/null || true)"
+  # EasyTier versions may render tables with ASCII pipes or Unicode box
+  # separators. Normalize both before reading the IPv4 and hostname columns.
+  normalized="$(printf '%s\n' "$output" | sed 's/│/|/g')"
+
+  while IFS='|' read -r _ ip host _; do
+    ip="${ip#"${ip%%[![:space:]]*}"}"
+    ip="${ip%"${ip##*[![:space:]]}"}"
+    host="${host#"${host%%[![:space:]]*}"}"
+    host="${host%"${host##*[![:space:]]}"}"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    [[ "$ip" == "$local_ip" || -n "${seen[$ip]:-}" ]] && continue
+    seen["$ip"]=1
+    printf '%s|%s\n' "$ip" "${host:-EasyTier peer}"
+  done <<< "$normalized"
+
+  # Fallback for future table layouts: extract 10.x virtual addresses directly.
+  while IFS= read -r ip; do
+    [[ "$ip" == "$local_ip" || -n "${seen[$ip]:-}" ]] && continue
+    seen["$ip"]=1
+    printf '%s|EasyTier peer\n' "$ip"
+  done < <(printf '%s\n' "$normalized" |
+    grep -Eo '10(\.[0-9]{1,3}){3}' || true)
+}
+
+install_haproxy_runtime() {
+  if command -v haproxy >/dev/null 2>&1; then return; fi
+  info "Installing HAProxy..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq haproxy
+  ok "HAProxy installed."
+}
+
+write_haproxy_service() {
+  cat > "$HAPROXY_SERVICE_FILE" <<EOF
+[Unit]
+Description=SuTun HAProxy TCP Tunnels
+Documentation=https://www.haproxy.org/
+Wants=network-online.target sutun.service
+After=network-online.target sutun.service
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/haproxy -Ws -f ${HAPROXY_CONFIG} -p /run/sutun-haproxy/haproxy.pid
+Restart=always
+RestartSec=3
+RuntimeDirectory=sutun-haproxy
+RuntimeDirectoryMode=0755
+LimitNOFILE=1048576
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+generate_haproxy_config() {
+  mkdir -p "$HAPROXY_TUNNEL_DIR"
+  local tmp="${HAPROXY_CONFIG}.tmp" definition name target port_spec listen_port target_port safe
+  {
+    cat <<'EOF'
+global
+    log stdout format raw local0
+    maxconn 100000
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 10s
+    timeout client 1h
+    timeout server 1h
+EOF
+    for definition in "$HAPROXY_TUNNEL_DIR"/*.env; do
+      [[ -f "$definition" ]] || continue
+      unset TUNNEL_NAME TARGET_IP PORT_SPEC
+      # shellcheck disable=SC1090
+      source "$definition"
+      # Values are loaded from the validated tunnel definition above.
+      # shellcheck disable=SC2153
+      name="$TUNNEL_NAME"
+      target="$TARGET_IP"
+      # shellcheck disable=SC2153
+      port_spec="$PORT_SPEC"
+      safe="${name//-/_}"
+      while IFS=$'\t' read -r listen_port target_port; do
+        cat <<EOF
+
+frontend xr_${safe}_${listen_port}
+    bind 0.0.0.0:${listen_port}
+    mode tcp
+    default_backend xr_${safe}_${listen_port}_backend
+
+backend xr_${safe}_${listen_port}_backend
+    mode tcp
+    server ${safe}_node ${target}:${target_port} check inter 5s fall 3 rise 2
+EOF
+      done < <(expand_port_mappings "$port_spec")
+    done
+  } > "$tmp"
+  mv -f "$tmp" "$HAPROXY_CONFIG"
+  chmod 600 "$HAPROXY_CONFIG"
+}
+
+apply_haproxy_config() {
+  local backup="" was_active=0
+  if [[ -f "$HAPROXY_CONFIG" ]]; then
+    backup="$(mktemp)"
+    cp -p "$HAPROXY_CONFIG" "$backup"
+  fi
+  if systemctl is-active --quiet sutun-haproxy.service 2>/dev/null; then
+    was_active=1
+  fi
+  generate_haproxy_config
+  if ! haproxy -c -f "$HAPROXY_CONFIG"; then
+    fail "HAProxy rejected the generated configuration."
+    [[ -z "$backup" ]] || cp -p "$backup" "$HAPROXY_CONFIG"
+    [[ -z "$backup" ]] || rm -f "$backup"
+    return 1
+  fi
+  write_haproxy_service
+  if ! systemctl enable sutun-haproxy.service >/dev/null ||
+     ! systemctl restart sutun-haproxy.service ||
+     ! systemctl is-active --quiet sutun-haproxy.service; then
+    fail "HAProxy failed to start with the new configuration."
+    if [[ -n "$backup" ]]; then
+      cp -p "$backup" "$HAPROXY_CONFIG"
+      if (( was_active )); then
+        systemctl restart sutun-haproxy.service 2>/dev/null || true
+      fi
+    else
+      systemctl disable --now sutun-haproxy.service 2>/dev/null || true
+      rm -f "$HAPROXY_CONFIG"
+    fi
+    [[ -z "$backup" ]] || rm -f "$backup"
+    return 1
+  fi
+  [[ -z "$backup" ]] || rm -f "$backup"
+  ok "HAProxy tunnel configuration applied."
+}
+
+validate_haproxy_ports() {
+  local tunnel_name="$1" port_spec="$2" definition port other_port
+  local -A requested=()
+  while IFS= read -r port; do requested["$port"]=1; done < <(expand_port_spec "$port_spec")
+  check_pck_link_ports "$port_spec" || return 1
+
+  for definition in "$HAPROXY_TUNNEL_DIR"/*.env; do
+    [[ -f "$definition" ]] || continue
+    unset TUNNEL_NAME TARGET_IP PORT_SPEC
+    # shellcheck disable=SC1090
+    source "$definition"
+    [[ "$TUNNEL_NAME" == "$tunnel_name" ]] && continue
+    while IFS= read -r other_port; do
+      if [[ -n "${requested[$other_port]:-}" ]]; then
+        fail "TCP port ${other_port} is already assigned to tunnel '${TUNNEL_NAME}'."
+        return 1
+      fi
+    done < <(expand_port_spec "$PORT_SPEC")
+  done
+
+  for port in "${!requested[@]}"; do
+    local listeners
+    listeners="$(ss -H -ltnp "sport = :${port}" 2>/dev/null || true)"
+    if [[ -n "$listeners" && "$listeners" != *haproxy* ]]; then
+      fail "TCP port ${port} is already used by another local service."
+      return 1
+    fi
+  done
+}
+
+save_haproxy_tunnel() {
+  local name="$1" target="$2" ports="$3" file="${HAPROXY_TUNNEL_DIR}/${1}.env"
+  mkdir -p "$HAPROXY_TUNNEL_DIR"
+  umask 077
+  {
+    printf 'TUNNEL_NAME="%s"\n' "$name"
+    printf 'TARGET_IP="%s"\n' "$target"
+    printf 'PORT_SPEC="%s"\n' "$ports"
+  } > "$file"
+}
+
+
+create_haproxy_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ ! -f "${HAPROXY_TUNNEL_DIR}/${name}.env" ]] || { fail "A tunnel with this name already exists."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_haproxy_runtime
+  validate_haproxy_ports "$name" "$ports" || return 1
+
+  save_haproxy_tunnel "$name" "$target" "$ports"
+  if apply_haproxy_config; then
+    ok "HAProxy tunnel '${name}' forwards TCP ports ${ports} to ${target}."
+  else
+    rm -f "${HAPROXY_TUNNEL_DIR}/${name}.env"
+    generate_haproxy_config
+    return 1
+  fi
+}
+
+delete_haproxy_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" file="${HAPROXY_TUNNEL_DIR}/${1}.env"
+  [[ -f "$file" ]] || { fail "HAProxy tunnel '${name}' not found."; return 1; }
+  rm -f "$file"
+  if compgen -G "${HAPROXY_TUNNEL_DIR}/*.env" >/dev/null; then
+    apply_haproxy_config
+  else
+    systemctl disable --now sutun-haproxy.service 2>/dev/null || true
+    rm -f "$HAPROXY_CONFIG" "$HAPROXY_SERVICE_FILE"
+    systemctl daemon-reload
+  fi
+  ok "HAProxy tunnel '${name}' deleted."
+}
+
+edit_haproxy_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ -f "${HAPROXY_TUNNEL_DIR}/${name}.env" ]] || { fail "HAProxy tunnel '${name}' not found."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_haproxy_runtime
+  validate_haproxy_ports "$name" "$ports" || return 1
+
+  local backup
+  backup="$(mktemp)"
+  cp "${HAPROXY_TUNNEL_DIR}/${name}.env" "$backup"
+  save_haproxy_tunnel "$name" "$target" "$ports"
+  if apply_haproxy_config; then
+    rm -f "$backup"
+    ok "HAProxy tunnel '${name}' updated."
+  else
+    mv "$backup" "${HAPROXY_TUNNEL_DIR}/${name}.env"
+    generate_haproxy_config
+    return 1
+  fi
+}
+
+install_iptables_runtime() {
+  if command -v iptables >/dev/null 2>&1; then return; fi
+  info "Installing iptables..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq iptables
+  ok "iptables installed."
+}
+
+valid_ipv4_address() {
+  local ip="$1" a b c d
+  IFS='.' read -r a b c d <<< "$ip"
+  [[ -n "${a:-}" && -n "${b:-}" && -n "${c:-}" && -n "${d:-}" ]] || return 1
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$a <= 255 && 10#$b <= 255 && 10#$c <= 255 && 10#$d <= 255 ))
+}
+
+valid_ipv4_cidr() {
+  local value="$1" ip prefix
+  if [[ "$value" == */* ]]; then
+    ip="${value%/*}"
+    prefix="${value##*/}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && (( prefix >= 0 && prefix <= 32 )) || return 1
+  else
+    ip="$value"
+  fi
+  valid_ipv4_address "$ip"
+}
+
+default_public_interface() {
+  ip -4 route show default 2>/dev/null | awk '/^default / {print $5; exit}'
+}
+
+iptables_protocols() {
+  case "$1" in
+    udp) printf '%s\n' udp ;;
+    tcp) printf '%s\n' tcp ;;
+    both) printf '%s\n' tcp udp ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_iptables_interface() {
+  [[ "$1" == "any" ]] && return 0
+  ip link show dev "$1" >/dev/null 2>&1
+}
+
+validate_iptables_ports() {
+  local tunnel_name="$1" protocol="$2" port_spec="$3" in_if="$4"
+  local definition other_port port proto other_proto listeners
+  local TUNNEL_NAME TARGET_IP PORT_SPEC FORWARD_PROTOCOL IN_IF SOURCE_CIDR
+  local -A requested=()
+
+  while IFS= read -r proto; do
+    while IFS= read -r port; do requested["${proto}:${port}"]=1; done < <(expand_port_spec "$port_spec")
+  done < <(iptables_protocols "$protocol")
+  if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+    check_pck_link_ports "$port_spec" || return 1
+  fi
+
+  for definition in "$IPTABLES_TUNNEL_DIR"/*.env; do
+    [[ -f "$definition" ]] || continue
+    TUNNEL_NAME=""; TARGET_IP=""; PORT_SPEC=""; FORWARD_PROTOCOL=""; IN_IF=""; SOURCE_CIDR=""
+    # shellcheck disable=SC1090
+    source "$definition"
+    [[ "$TUNNEL_NAME" == "$tunnel_name" ]] && continue
+    [[ "$in_if" == "any" || "$IN_IF" == "any" || "$in_if" == "$IN_IF" ]] || continue
+    while IFS= read -r other_proto; do
+      while IFS= read -r other_port; do
+        if [[ -n "${requested[${other_proto}:${other_port}]:-}" ]]; then
+          fail "${other_proto^^} port ${other_port} is already assigned to iptables tunnel '${TUNNEL_NAME}'."
+          return 1
+        fi
+      done < <(expand_port_spec "$PORT_SPEC")
+    done < <(iptables_protocols "$FORWARD_PROTOCOL")
+  done
+
+  for proto in tcp udp; do
+    while IFS= read -r port; do
+      [[ -n "${requested[${proto}:${port}]:-}" ]] || continue
+      if [[ "$proto" == "tcp" ]]; then
+        listeners="$(ss -H -ltnp "sport = :${port}" 2>/dev/null || true)"
+      else
+        listeners="$(ss -H -lunp "sport = :${port}" 2>/dev/null || true)"
+      fi
+      if [[ -n "$listeners" ]]; then
+        fail "${proto^^} port ${port} is already used by a local service."
+        return 1
+      fi
+    done < <(expand_port_spec "$port_spec")
+  done
+}
+
+write_ip_forwarding_config() {
+  cat > "$IPTABLES_SYSCTL_FILE" <<'EOF_SYSCTL'
+# Managed by SuTun iptables tunnels.
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF_SYSCTL
+  chmod 644 "$IPTABLES_SYSCTL_FILE"
+  sysctl -p "$IPTABLES_SYSCTL_FILE" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+}
+
+save_iptables_tunnel() {
+  local name="$1" target="$2" ports="$3" protocol="${4:-udp}"
+  local in_if="${5:-any}" source_cidr="${6:-0.0.0.0/0}"
+  local file="${IPTABLES_TUNNEL_DIR}/${name}.env"
+  mkdir -p "$IPTABLES_TUNNEL_DIR"
+  umask 077
+  {
+    printf 'TUNNEL_NAME="%s"\n' "$name"
+    printf 'TARGET_IP="%s"\n' "$target"
+    printf 'PORT_SPEC="%s"\n' "$ports"
+    printf 'FORWARD_PROTOCOL="%s"\n' "$protocol"
+    printf 'IN_IF="%s"\n' "$in_if"
+    printf 'SOURCE_CIDR="%s"\n' "$source_cidr"
+  } > "$file"
+}
+
+write_iptables_service() {
+  cat > "$IPTABLES_SERVICE_FILE" <<EOF_SERVICE
+[Unit]
+Description=SuTun iptables UDP/TCP Tunnels
+Wants=network-online.target sutun.service
+After=network-online.target sutun.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${IPTABLES_APPLY_SCRIPT} apply
+ExecReload=${IPTABLES_APPLY_SCRIPT} apply
+ExecStop=${IPTABLES_APPLY_SCRIPT} remove
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF_SERVICE
+  systemctl daemon-reload
+}
+
+generate_iptables_apply_script() {
+  mkdir -p "$IPTABLES_TUNNEL_DIR" "$INSTALL_DIR"
+  local tmp="${IPTABLES_APPLY_SCRIPT}.tmp"
+  local definition target port_spec protocol in_if source_cidr proto listen_port target_port
+  local TUNNEL_NAME TARGET_IP PORT_SPEC FORWARD_PROTOCOL IN_IF SOURCE_CIDR
+
+  cat > "$tmp" <<'EOF_SCRIPT'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+IPT="${IPT:-iptables}"
+DNAT_CHAIN="SUTUN_DNAT"
+SNAT_CHAIN="SUTUN_SNAT"
+FWD_CHAIN="SUTUN_FWD"
+
+remove_jump() {
+  local table="$1" parent="$2" child="$3"
+  while "$IPT" -w -t "$table" -C "$parent" -j "$child" >/dev/null 2>&1; do
+    "$IPT" -w -t "$table" -D "$parent" -j "$child"
+  done
+}
+
+remove_chain() {
+  local table="$1" chain="$2"
+  "$IPT" -w -t "$table" -F "$chain" >/dev/null 2>&1 || true
+  "$IPT" -w -t "$table" -X "$chain" >/dev/null 2>&1 || true
+}
+
+remove_rules() {
+  remove_jump nat PREROUTING "$DNAT_CHAIN"
+  remove_jump nat POSTROUTING "$SNAT_CHAIN"
+  remove_jump filter FORWARD "$FWD_CHAIN"
+  remove_chain nat "$DNAT_CHAIN"
+  remove_chain nat "$SNAT_CHAIN"
+  remove_chain filter "$FWD_CHAIN"
+}
+
+apply_rules() {
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  remove_rules
+  "$IPT" -w -t nat -N "$DNAT_CHAIN"
+  "$IPT" -w -t nat -N "$SNAT_CHAIN"
+  "$IPT" -w -t filter -N "$FWD_CHAIN"
+EOF_SCRIPT
+
+  for definition in "$IPTABLES_TUNNEL_DIR"/*.env; do
+    [[ -f "$definition" ]] || continue
+    TUNNEL_NAME=""; TARGET_IP=""; PORT_SPEC=""; FORWARD_PROTOCOL=""; IN_IF=""; SOURCE_CIDR=""
+    # shellcheck disable=SC1090
+    source "$definition"
+    target="$TARGET_IP"
+    port_spec="$PORT_SPEC"
+    protocol="$FORWARD_PROTOCOL"
+    in_if="$IN_IF"
+    source_cidr="$SOURCE_CIDR"
+
+    # shellcheck disable=SC2016,SC2129
+    while IFS= read -r proto; do
+      while IFS=$'\t' read -r listen_port target_port; do
+        printf '  "$IPT" -w -t nat -A "$DNAT_CHAIN"' >> "$tmp"
+        [[ "$in_if" == "any" ]] || printf ' -i %q' "$in_if" >> "$tmp"
+        printf ' -s %q -p %q --dport %q -j DNAT --to-destination %q\n' \
+          "$source_cidr" "$proto" "$listen_port" "${target}:${target_port}" >> "$tmp"
+
+        printf '  "$IPT" -w -t filter -A "$FWD_CHAIN"' >> "$tmp"
+        [[ "$in_if" == "any" ]] || printf ' -i %q' "$in_if" >> "$tmp"
+        printf ' -s %q -p %q -d %q --dport %q -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT\n' \
+          "$source_cidr" "$proto" "$target" "$target_port" >> "$tmp"
+
+        printf '  "$IPT" -w -t filter -A "$FWD_CHAIN" -p %q -s %q --sport %q -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n' \
+          "$proto" "$target" "$target_port" >> "$tmp"
+
+        printf '  "$IPT" -w -t nat -A "$SNAT_CHAIN" -p %q -d %q --dport %q -m conntrack --ctstate DNAT -j MASQUERADE\n' \
+          "$proto" "$target" "$target_port" >> "$tmp"
+      done < <(expand_port_mappings "$port_spec")
+    done < <(iptables_protocols "$protocol")
+  done
+
+  cat >> "$tmp" <<'EOF_SCRIPT'
+  "$IPT" -w -t nat -I PREROUTING 1 -j "$DNAT_CHAIN"
+  "$IPT" -w -t nat -I POSTROUTING 1 -j "$SNAT_CHAIN"
+  "$IPT" -w -t filter -I FORWARD 1 -j "$FWD_CHAIN"
+}
+
+case "${1:-apply}" in
+  apply) apply_rules ;;
+  remove) remove_rules ;;
+  *) echo "Usage: $0 [apply|remove]" >&2; exit 2 ;;
+esac
+EOF_SCRIPT
+
+  mv -f "$tmp" "$IPTABLES_APPLY_SCRIPT"
+  chmod 700 "$IPTABLES_APPLY_SCRIPT"
+}
+
+apply_iptables_config() {
+  local backup="" was_active=0
+  install_iptables_runtime
+  write_ip_forwarding_config
+
+  if [[ -f "$IPTABLES_APPLY_SCRIPT" ]]; then
+    backup="$(mktemp)"
+    cp -p "$IPTABLES_APPLY_SCRIPT" "$backup"
+  fi
+  if systemctl is-active --quiet sutun-iptables.service 2>/dev/null; then
+    was_active=1
+  fi
+
+  generate_iptables_apply_script
+  write_iptables_service
+
+  if ! "$IPTABLES_APPLY_SCRIPT" apply; then
+    fail "iptables rejected one or more generated rules."
+    "$IPTABLES_APPLY_SCRIPT" remove >/dev/null 2>&1 || true
+    if [[ -n "$backup" ]]; then
+      cp -p "$backup" "$IPTABLES_APPLY_SCRIPT"
+      "$IPTABLES_APPLY_SCRIPT" apply >/dev/null 2>&1 || true
+    fi
+    [[ -z "$backup" ]] || rm -f "$backup"
+    return 1
+  fi
+
+  if ! systemctl enable sutun-iptables.service >/dev/null ||
+     ! systemctl restart sutun-iptables.service ||
+     ! systemctl is-active --quiet sutun-iptables.service; then
+    fail "The SuTun iptables service failed to start."
+    if [[ -n "$backup" ]]; then
+      cp -p "$backup" "$IPTABLES_APPLY_SCRIPT"
+      if (( was_active )); then
+        systemctl restart sutun-iptables.service 2>/dev/null || true
+      else
+        "$IPTABLES_APPLY_SCRIPT" apply >/dev/null 2>&1 || true
+      fi
+    else
+      "$IPTABLES_APPLY_SCRIPT" remove >/dev/null 2>&1 || true
+      systemctl disable --now sutun-iptables.service 2>/dev/null || true
+    fi
+    [[ -z "$backup" ]] || rm -f "$backup"
+    return 1
+  fi
+
+  [[ -z "$backup" ]] || rm -f "$backup"
+  ok "iptables tunnel configuration applied."
+}
+
+disable_iptables_tunnels() {
+  systemctl disable --now sutun-iptables.service 2>/dev/null || true
+  if [[ -x "$IPTABLES_APPLY_SCRIPT" ]]; then
+    "$IPTABLES_APPLY_SCRIPT" remove >/dev/null 2>&1 || true
+  fi
+  rm -f "$IPTABLES_SERVICE_FILE" "$IPTABLES_APPLY_SCRIPT" "$IPTABLES_SYSCTL_FILE"
+  systemctl daemon-reload
+}
+
+create_iptables_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-udp}" in_if="${5:-any}" source_cidr="${6:-0.0.0.0/0}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ ! -f "${IPTABLES_TUNNEL_DIR}/${name}.env" ]] || { fail "A tunnel with this name already exists."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  [[ "$protocol" =~ ^(tcp|udp|both)$ ]] || { fail "Protocol must be tcp, udp, or both."; return 1; }
+  validate_iptables_interface "$in_if" || { fail "Interface '${in_if}' does not exist."; return 1; }
+  valid_ipv4_cidr "$source_cidr" || { fail "Invalid source IPv4/CIDR '${source_cidr}'."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_iptables_runtime
+  validate_iptables_ports "$name" "$protocol" "$ports" "$in_if" || return 1
+
+  save_iptables_tunnel "$name" "$target" "$ports" "$protocol" "$in_if" "$source_cidr"
+  if apply_iptables_config; then
+    ok "iptables tunnel '${name}' forwards ${protocol^^} ports ${ports} to ${target}."
+  else
+    rm -f "${IPTABLES_TUNNEL_DIR}/${name}.env"
+    generate_iptables_apply_script
+    return 1
+  fi
+}
+
+delete_iptables_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" file="${IPTABLES_TUNNEL_DIR}/${1}.env"
+  [[ -f "$file" ]] || { fail "iptables tunnel '${name}' not found."; return 1; }
+  rm -f "$file"
+  if compgen -G "${IPTABLES_TUNNEL_DIR}/*.env" >/dev/null; then
+    apply_iptables_config
+  else
+    disable_iptables_tunnels
+  fi
+  ok "iptables tunnel '${name}' deleted."
+}
+
+edit_iptables_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-udp}" in_if="${5:-any}" source_cidr="${6:-0.0.0.0/0}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ -f "${IPTABLES_TUNNEL_DIR}/${name}.env" ]] || { fail "iptables tunnel '${name}' not found."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  [[ "$protocol" =~ ^(tcp|udp|both)$ ]] || { fail "Protocol must be tcp, udp, or both."; return 1; }
+  validate_iptables_interface "$in_if" || { fail "Interface '${in_if}' does not exist."; return 1; }
+  valid_ipv4_cidr "$source_cidr" || { fail "Invalid source IPv4/CIDR '${source_cidr}'."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_iptables_runtime
+  validate_iptables_ports "$name" "$protocol" "$ports" "$in_if" || return 1
+
+  local backup
+  backup="$(mktemp)"
+  cp "${IPTABLES_TUNNEL_DIR}/${name}.env" "$backup"
+  save_iptables_tunnel "$name" "$target" "$ports" "$protocol" "$in_if" "$source_cidr"
+  if apply_iptables_config; then
+    rm -f "$backup"
+    ok "iptables tunnel '${name}' updated."
+  else
+    mv "$backup" "${IPTABLES_TUNNEL_DIR}/${name}.env"
+    generate_iptables_apply_script
+    return 1
+  fi
+}
+
+gost_arch_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "linux_amd64" ;;
+    aarch64|arm64) echo "linux_arm64" ;;
+    armv7*|armhf) echo "linux_armv7" ;;
+    i686|i386) echo "linux_386" ;;
+    *) fail "Unsupported architecture for GOST: $(uname -m)"; return 1 ;;
+  esac
+}
+
+install_gost_runtime() {
+  if [[ -x "$GOST_BIN" ]]; then
+    return 0
+  fi
+  require_root
+  install_dependencies
+  local arch asset_name version url checksums_url tmp release_json expected_digest actual_digest
+  arch="$(gost_arch_asset)" || return 1
+  tmp="$(mktemp -d)"
+  release_json="${tmp}/release.json"
+
+  if ! curl -fsSL --connect-timeout 8 --max-time 20 \
+    https://api.github.com/repos/go-gost/gost/releases/latest -o "$release_json"; then
+    warn "Latest GOST release lookup failed; checking the fallback release."
+    curl -fsSL --connect-timeout 8 --max-time 20 \
+      "https://api.github.com/repos/go-gost/gost/releases/tags/${FALLBACK_GOST_VERSION}" \
+      -o "$release_json" || { fail "Could not retrieve trusted GOST release metadata."; rm -rf -- "$tmp"; return 1; }
+  fi
+
+  version="$(jq -er '.tag_name' "$release_json")" ||
+    { fail "GOST release metadata is invalid."; rm -rf -- "$tmp"; return 1; }
+  local clean_ver="${version#v}"
+  asset_name="gost_${clean_ver}_${arch}.tar.gz"
+
+  url="$(jq -er --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' "$release_json")" ||
+    { fail "No official GOST asset exists for $(uname -m)."; rm -rf -- "$tmp"; return 1; }
+  checksums_url="$(jq -er '.assets[] | select(.name == "checksums.txt") | .browser_download_url' "$release_json")" || true
+
+  info "Downloading GOST ${version} for $(uname -m)..."
+  mkdir -p "$BIN_DIR" "$GOST_TUNNEL_DIR" /etc/sutun
+  local curl_opts=(-fL --retry 3 --connect-timeout 10)
+  if [[ -t 1 ]]; then
+    curl_opts+=(--progress-bar)
+  else
+    curl_opts+=(-sS)
+  fi
+  if ! curl "${curl_opts[@]}" "$url" -o "${tmp}/gost.tar.gz"; then
+    fail "Download failed: $url"
+    rm -rf -- "$tmp"
+    return 1
+  fi
+
+  if [[ -n "$checksums_url" ]] && curl -fsSL --connect-timeout 8 --max-time 15 "$checksums_url" -o "${tmp}/checksums.txt" 2>/dev/null; then
+    expected_digest="$( (grep -E "[[:space:]]${asset_name}\$" "${tmp}/checksums.txt" 2>/dev/null || true) | awk '{print $1}' )"
+    if [[ -n "$expected_digest" ]]; then
+      actual_digest="$(sha256sum "${tmp}/gost.tar.gz" | awk '{print $1}')"
+      if [[ "${actual_digest,,}" != "${expected_digest,,}" ]]; then
+        fail "GOST archive checksum verification failed. Download discarded."
+        rm -rf -- "$tmp"
+        return 1
+      fi
+      ok "GOST archive SHA-256 verified."
+    fi
+  fi
+
+  tar -xzf "${tmp}/gost.tar.gz" -C "$tmp"
+  local bin
+  bin="$(find "$tmp" -type f -name gost | head -n1)"
+  if [[ -z "$bin" ]]; then
+    fail "GOST binary not found in archive."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  install -m 0755 "$bin" "$GOST_BIN"
+  printf '%s\n' "$version" > "${INSTALL_DIR}/gost.version"
+  write_gost_service
+  rm -rf -- "$tmp"
+  ok "GOST ${version} installed successfully."
+}
+
+write_gost_service() {
+  cat > "$GOST_SERVICE_FILE" <<EOF_GOST_SVC
+[Unit]
+Description=SuTun GOST Tunnel Daemon
+Documentation=https://gost.run/
+Wants=network-online.target sutun.service
+After=network-online.target sutun.service
+
+[Service]
+Type=simple
+ExecStart=${GOST_BIN} -C ${GOST_CONFIG_FILE}
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+SyslogIdentifier=sutun-gost
+
+[Install]
+WantedBy=multi-user.target
+EOF_GOST_SVC
+  systemctl daemon-reload
+}
+
+validate_gost_ports() {
+  local tunnel_name="$1" port_spec="$2" protocol="${3:-both}"
+  local definition port other_port
+  local -A requested=()
+  while IFS= read -r port; do requested["$port"]=1; done < <(expand_port_spec "$port_spec")
+  if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+    check_pck_link_ports "$port_spec" || return 1
+  fi
+
+  for definition in "$GOST_TUNNEL_DIR"/*.env; do
+    [[ -f "$definition" ]] || continue
+    unset TUNNEL_NAME TARGET_IP PORT_SPEC PROTOCOL
+    # shellcheck disable=SC1090
+    source "$definition"
+    [[ "$TUNNEL_NAME" == "$tunnel_name" ]] && continue
+    local other_proto="${PROTOCOL:-both}"
+    if [[ "$protocol" == "both" || "$other_proto" == "both" || "$protocol" == "$other_proto" ]]; then
+      while IFS= read -r other_port; do
+        if [[ -n "${requested[$other_port]:-}" ]]; then
+          fail "Port ${other_port} (${protocol^^}) is already assigned to GOST tunnel '${TUNNEL_NAME}' (${other_proto^^})."
+          return 1
+        fi
+      done < <(expand_port_spec "$PORT_SPEC")
+    fi
+  done
+
+  if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+    for definition in "$HAPROXY_TUNNEL_DIR"/*.env; do
+      [[ -f "$definition" ]] || continue
+      unset TUNNEL_NAME TARGET_IP PORT_SPEC
+      # shellcheck disable=SC1090
+      source "$definition"
+      while IFS= read -r other_port; do
+        if [[ -n "${requested[$other_port]:-}" ]]; then
+          fail "TCP port ${other_port} conflicts with HAProxy tunnel '${TUNNEL_NAME}'."
+          return 1
+        fi
+      done < <(expand_port_spec "$PORT_SPEC")
+    done
+  fi
+
+  return 0
+}
+
+save_gost_tunnel() {
+  local name="$1" target="$2" ports="$3" protocol="${4:-both}"
+  local file="${GOST_TUNNEL_DIR}/${name}.env"
+  mkdir -p "$GOST_TUNNEL_DIR"
+  umask 077
+  {
+    printf 'TUNNEL_NAME="%s"\n' "$name"
+    printf 'TARGET_IP="%s"\n' "$target"
+    printf 'PORT_SPEC="%s"\n' "$ports"
+    printf 'PROTOCOL="%s"\n' "$protocol"
+  } > "$file"
+}
+
+generate_gost_config() {
+  if ! compgen -G "${GOST_TUNNEL_DIR}/*.env" >/dev/null; then
+    systemctl disable --now sutun-gost.service 2>/dev/null || true
+    rm -f "$GOST_CONFIG_FILE"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$GOST_CONFIG_FILE")"
+  local tmp first_service=1 definition listen_port target_port
+  tmp="$(mktemp)"
+
+  {
+    printf '{\n  "services": [\n'
+    for definition in "${GOST_TUNNEL_DIR}"/*.env; do
+      [[ -f "$definition" ]] || continue
+      unset TUNNEL_NAME TARGET_IP PORT_SPEC PROTOCOL
+      # shellcheck disable=SC1090
+      source "$definition"
+      local name="${TUNNEL_NAME:-$(basename "$definition" .env)}"
+      local target="${TARGET_IP:-}"
+      local port_spec="${PORT_SPEC:-}"
+      local protocol="${PROTOCOL:-both}"
+      protocol="${protocol,,}"
+
+      [[ -n "$target" && -n "$port_spec" ]] || continue
+
+      while IFS=$'\t' read -r listen_port target_port; do
+        [[ -n "$listen_port" && -n "$target_port" ]] || continue
+
+        if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+          if (( first_service )); then
+            first_service=0
+          else
+            printf ',\n'
+          fi
+          cat <<EOF_JSON_TCP
+    {
+      "name": "${name}-tcp-${listen_port}",
+      "addr": ":${listen_port}",
+      "handler": {
+        "type": "tcp"
+      },
+      "listener": {
+        "type": "tcp"
+      },
+      "forwarder": {
+        "nodes": [
+          {
+            "name": "target-tcp-${listen_port}",
+            "addr": "${target}:${target_port}"
+          }
+        ]
+      }
+    }
+EOF_JSON_TCP
+        fi
+
+        if [[ "$protocol" == "udp" || "$protocol" == "both" ]]; then
+          if (( first_service )); then
+            first_service=0
+          else
+            printf ',\n'
+          fi
+          cat <<EOF_JSON_UDP
+    {
+      "name": "${name}-udp-${listen_port}",
+      "addr": ":${listen_port}",
+      "handler": {
+        "type": "udp"
+      },
+      "listener": {
+        "type": "udp"
+      },
+      "forwarder": {
+        "nodes": [
+          {
+            "name": "target-udp-${listen_port}",
+            "addr": "${target}:${target_port}"
+          }
+        ]
+      }
+    }
+EOF_JSON_UDP
+        fi
+      done < <(expand_port_mappings "$port_spec")
+    done
+    printf '\n  ]\n}\n'
+  } > "$tmp"
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    fail "Failed to generate GOST configuration."
+    return 1
+  fi
+
+  mv -f "$tmp" "$GOST_CONFIG_FILE"
+  chmod 0600 "$GOST_CONFIG_FILE"
+}
+
+apply_gost_config() {
+  generate_gost_config || return 1
+  if compgen -G "${GOST_TUNNEL_DIR}/*.env" >/dev/null; then
+    [[ -f "$GOST_SERVICE_FILE" ]] || write_gost_service
+    systemctl enable --now sutun-gost.service 2>/dev/null || true
+    systemctl restart sutun-gost.service 2>/dev/null || (systemctl kill -s SIGKILL sutun-gost.service 2>/dev/null && systemctl start sutun-gost.service 2>/dev/null) || true
+    ok "GOST tunnel configuration applied."
+  fi
+}
+
+create_gost_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-both}"
+  protocol="${protocol,,}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ ! -f "${GOST_TUNNEL_DIR}/${name}.env" ]] || { fail "A tunnel with this name already exists."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_gost_runtime
+  validate_gost_ports "$name" "$ports" "$protocol" || return 1
+
+  save_gost_tunnel "$name" "$target" "$ports" "$protocol"
+  if apply_gost_config; then
+    ok "GOST tunnel '${name}' forwards ${protocol^^} ports ${ports} to ${target}."
+  else
+    rm -f "${GOST_TUNNEL_DIR}/${name}.env"
+    generate_gost_config
+    return 1
+  fi
+}
+
+delete_gost_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" file="${GOST_TUNNEL_DIR}/${1}.env"
+  [[ -f "$file" ]] || { fail "GOST tunnel '${name}' not found."; return 1; }
+  rm -f "$file"
+  apply_gost_config
+  ok "GOST tunnel '${name}' deleted."
+}
+
+edit_gost_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-both}"
+  protocol="${protocol,,}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ -f "${GOST_TUNNEL_DIR}/${name}.env" ]] || { fail "GOST tunnel '${name}' not found."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_gost_runtime
+  validate_gost_ports "$name" "$ports" "$protocol" || return 1
+
+  local backup
+  backup="$(mktemp)"
+  cp "${GOST_TUNNEL_DIR}/${name}.env" "$backup"
+  save_gost_tunnel "$name" "$target" "$ports" "$protocol"
+  if apply_gost_config; then
+    rm -f "$backup"
+    ok "GOST tunnel '${name}' updated."
+  else
+    mv "$backup" "${GOST_TUNNEL_DIR}/${name}.env"
+    generate_gost_config
+    return 1
+  fi
+}
+
+# ==============================================================================
+# REALM RELAY TUNNELS (RUST)
+# ==============================================================================
+
+install_realm_runtime() {
+  [[ -x "$REALM_BIN" ]] && return 0
+
+  header
+  info "Installing Realm high-performance relay runtime..."
+  mkdir -p "$BIN_DIR" "$REALM_TUNNEL_DIR"
+  local arch target_arch version="$FALLBACK_REALM_VERSION"
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) target_arch="x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64) target_arch="aarch64-unknown-linux-gnu" ;;
+    armv7*|armv8l|armhf) target_arch="armv7-unknown-linux-musleabihf" ;;
+    arm*) target_arch="arm-unknown-linux-musleabi" ;;
+    i386|i686) target_arch="i686-unknown-linux-musl" ;;
+    *)
+      fail "Unsupported CPU architecture for Realm: $arch"
+      return 1
+      ;;
+  esac
+
+  local tmp download_url
+  tmp="$(mktemp -d)"
+  download_url="https://github.com/zhboner/realm/releases/download/${version}/realm-${target_arch}.tar.gz"
+
+  info "Downloading Realm ${version} (${target_arch})..."
+  if ! curl -fsSL --connect-timeout 10 --max-time 60 "$download_url" -o "${tmp}/realm.tar.gz"; then
+    fail "Failed to download Realm from ${download_url}."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+
+  tar -xzf "${tmp}/realm.tar.gz" -C "$tmp"
+  local bin
+  bin="$(find "$tmp" -type f -name realm | head -n1)"
+  if [[ -z "$bin" ]]; then
+    fail "Realm binary not found in archive."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+
+  install -m 0755 "$bin" "$REALM_BIN"
+  printf '%s\n' "$version" > "${INSTALL_DIR}/realm.version"
+  write_realm_service
+  rm -rf -- "$tmp"
+  ok "Realm ${version} installed successfully."
+}
+
+write_realm_service() {
+  cat > "$REALM_SERVICE_FILE" <<EOF_REALM_SVC
+[Unit]
+Description=SuTun Realm Tunnel Daemon (Rust)
+Documentation=https://github.com/zhboner/realm
+Wants=network-online.target sutun.service
+After=network-online.target sutun.service
+
+[Service]
+Type=simple
+ExecStart=${REALM_BIN} -c ${REALM_CONFIG_FILE}
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+LimitNOFILE=1048576
+SyslogIdentifier=sutun-realm
+
+[Install]
+WantedBy=multi-user.target
+EOF_REALM_SVC
+  systemctl daemon-reload
+}
+
+generate_realm_config() {
+  if ! compgen -G "${REALM_TUNNEL_DIR}/*.env" >/dev/null; then
+    systemctl disable --now sutun-realm.service 2>/dev/null || true
+    rm -f "$REALM_CONFIG_FILE"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$REALM_CONFIG_FILE")"
+  local tmp first_ep=1 definition listen_port target_port
+  tmp="$(mktemp)"
+
+  {
+    printf '{\n'
+    printf '  "log": {\n    "level": "warn",\n    "output": "stdout"\n  },\n'
+    printf '  "network": {\n    "no_tcp": false,\n    "use_udp": true\n  },\n'
+    printf '  "endpoints": [\n'
+    for definition in "${REALM_TUNNEL_DIR}"/*.env; do
+      [[ -f "$definition" ]] || continue
+      unset TUNNEL_NAME TARGET_IP PORT_SPEC PROTOCOL
+      # shellcheck disable=SC1090
+      source "$definition"
+      local target="${TARGET_IP:-}"
+      local port_spec="${PORT_SPEC:-}"
+      local protocol="${PROTOCOL:-both}"
+      protocol="${protocol,,}"
+      local no_tcp="false" use_udp="true"
+      if [[ "$protocol" == "tcp" ]]; then
+        no_tcp="false"
+        use_udp="false"
+      elif [[ "$protocol" == "udp" ]]; then
+        no_tcp="true"
+        use_udp="true"
+      else
+        no_tcp="false"
+        use_udp="true"
+      fi
+
+      [[ -n "$target" && -n "$port_spec" ]] || continue
+
+      while IFS=$'\t' read -r listen_port target_port; do
+        [[ -n "$listen_port" && -n "$target_port" ]] || continue
+        if (( first_ep )); then
+          first_ep=0
+        else
+          printf ',\n'
+        fi
+        cat <<EOF_EP
+    {
+      "listen": "0.0.0.0:${listen_port}",
+      "remote": "${target}:${target_port}",
+      "network": {
+        "no_tcp": ${no_tcp},
+        "use_udp": ${use_udp}
+      }
+    }
+EOF_EP
+      done < <(expand_port_mappings "$port_spec")
+    done
+    printf '\n  ]\n}\n'
+  } > "$tmp"
+
+  if [[ ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    fail "Failed to generate Realm configuration."
+    return 1
+  fi
+
+  install -m 0600 "$tmp" "$REALM_CONFIG_FILE"
+  rm -f "$tmp"
+  return 0
+}
+
+apply_realm_config() {
+  if ! compgen -G "${REALM_TUNNEL_DIR}/*.env" >/dev/null; then
+    systemctl disable --now sutun-realm.service 2>/dev/null || true
+    rm -f "$REALM_CONFIG_FILE"
+    return 0
+  fi
+
+  generate_realm_config || return 1
+  write_realm_service
+  systemctl enable --now sutun-realm.service >/dev/null 2>&1 || true
+  systemctl restart sutun-realm.service
+  if systemctl is-active --quiet sutun-realm.service; then
+    return 0
+  else
+    fail "Realm service failed to start. Showing recent logs:"
+    journalctl -u sutun-realm.service -n 20 --no-pager
+    return 1
+  fi
+}
+
+validate_realm_ports() {
+  local tunnel_name="$1" port_spec="$2" protocol="${3:-both}"
+  local definition port other_port
+  local -A requested=()
+  while IFS= read -r port; do requested["$port"]=1; done < <(expand_port_spec "$port_spec")
+  if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+    check_pck_link_ports "$port_spec" || return 1
+  fi
+
+  for definition in "$REALM_TUNNEL_DIR"/*.env; do
+    [[ -f "$definition" ]] || continue
+    unset TUNNEL_NAME TARGET_IP PORT_SPEC PROTOCOL
+    # shellcheck disable=SC1090
+    source "$definition"
+    [[ "$TUNNEL_NAME" == "$tunnel_name" ]] && continue
+    local other_proto="${PROTOCOL:-both}"
+    if [[ "$protocol" == "both" || "$other_proto" == "both" || "$protocol" == "$other_proto" ]]; then
+      while IFS= read -r other_port; do
+        if [[ -n "${requested[$other_port]:-}" ]]; then
+          fail "Port ${other_port} (${protocol^^}) is already assigned to Realm tunnel '${TUNNEL_NAME}' (${other_proto^^})."
+          return 1
+        fi
+      done < <(expand_port_spec "$PORT_SPEC")
+    fi
+  done
+
+  if [[ "$protocol" == "tcp" || "$protocol" == "both" ]]; then
+    for definition in "$HAPROXY_TUNNEL_DIR"/*.env; do
+      [[ -f "$definition" ]] || continue
+      unset TUNNEL_NAME TARGET_IP PORT_SPEC
+      # shellcheck disable=SC1090
+      source "$definition"
+      while IFS= read -r other_port; do
+        if [[ -n "${requested[$other_port]:-}" ]]; then
+          fail "TCP port ${other_port} conflicts with HAProxy tunnel '${TUNNEL_NAME}'."
+          return 1
+        fi
+      done < <(expand_port_spec "$PORT_SPEC")
+    done
+  fi
+
+  return 0
+}
+
+save_realm_tunnel() {
+  local name="$1" target="$2" ports="$3" protocol="${4:-both}"
+  local file="${REALM_TUNNEL_DIR}/${name}.env"
+  mkdir -p "$REALM_TUNNEL_DIR"
+  umask 077
+  {
+    printf 'TUNNEL_NAME="%s"\n' "$name"
+    printf 'TARGET_IP="%s"\n' "$target"
+    printf 'PORT_SPEC="%s"\n' "$ports"
+    printf 'PROTOCOL="%s"\n' "$protocol"
+  } > "$file"
+}
+
+create_realm_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-both}"
+  protocol="${protocol,,}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ ! -f "${REALM_TUNNEL_DIR}/${name}.env" ]] || { fail "A tunnel with this name already exists."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_realm_runtime
+  validate_realm_ports "$name" "$ports" "$protocol" || return 1
+
+  save_realm_tunnel "$name" "$target" "$ports" "$protocol"
+  if apply_realm_config; then
+    ok "Realm tunnel '${name}' forwards ${protocol^^} ports ${ports} to ${target}."
+  else
+    rm -f "${REALM_TUNNEL_DIR}/${name}.env"
+    generate_realm_config
+    return 1
+  fi
+}
+
+delete_realm_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" file="${REALM_TUNNEL_DIR}/${1}.env"
+  [[ -f "$file" ]] || { fail "Realm tunnel '${name}' not found."; return 1; }
+  rm -f "$file"
+  apply_realm_config
+  ok "Realm tunnel '${name}' deleted."
+}
+
+edit_realm_tunnel_noninteractive() {
+  require_root
+  local name="${1:-}" target="${2:-}" ports="${3:-}" protocol="${4:-both}"
+  protocol="${protocol,,}"
+  validate_tunnel_name "$name" || { fail "Tunnel name must be 1-32 characters using only letters, numbers, '_' or '-'."; return 1; }
+  [[ -f "${REALM_TUNNEL_DIR}/${name}.env" ]] || { fail "Realm tunnel '${name}' not found."; return 1; }
+  valid_ip "$target" || { fail "Target must be a valid 10.x.x.x mesh IP."; return 1; }
+  expand_port_spec "$ports" >/dev/null || { fail "Invalid port specification. Use ports/ranges or LISTEN:TARGET mappings."; return 1; }
+  install_realm_runtime
+  validate_realm_ports "$name" "$ports" "$protocol" || return 1
+
+  local backup
+  backup="$(mktemp)"
+  cp "${REALM_TUNNEL_DIR}/${name}.env" "$backup"
+  save_realm_tunnel "$name" "$target" "$ports" "$protocol"
+  if apply_realm_config; then
+    rm -f "$backup"
+    ok "Realm tunnel '${name}' updated."
+  else
+    mv "$backup" "${REALM_TUNNEL_DIR}/${name}.env"
+    generate_realm_config
+    return 1
+  fi
+}
+
+# ==============================================================================
+# BackPack links (ICMP via xDi, PCK)
+# ==============================================================================
+# A link is one BackPack layer-3 tunnel between two servers, carried inside ICMP echo (xdi)
+# or inside TCP segments that bypass the kernel's TCP stack (pck).
+# The server that issues the invite listens ("in-N"); the joining server dials ("out-N").
+# Both derive the same /30 from the link index N, and EasyTier peers across it over UDP.
+# Every carrier shares one index pool, so links of different carriers never overlap.
+
+is_backpack_proto() { [[ "$1" == "icmp" || "$1" == "pck" ]]; }
+
+# Mesh protocol -> BackPack carrier.
+backpack_carrier_for_proto() {
+  case "$1" in
+    icmp) echo "xdi" ;;
+    pck) echo "pck" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The invite key that carries the link: ICMP keeps "icmp" so older joiners still read it.
+invite_link_key() {
+  if [[ "$1" == "icmp" ]]; then echo "icmp"; else echo "link"; fi
+}
+
+valid_backpack_carrier() { [[ "$1" == "xdi" || "$1" == "pck" ]]; }
+
+backpack_arch_asset() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "backpack_linux_amd64.tar.gz" ;;
+    aarch64|arm64) echo "backpack_linux_arm64.tar.gz" ;;
+    armv7*|armhf) echo "backpack_linux_armv7.tar.gz" ;;
+    i686|i386) echo "backpack_linux_386.tar.gz" ;;
+    *) fail "Unsupported architecture for BackPack (ICMP/PCK) links: $(uname -m)"; return 1 ;;
+  esac
+}
+
+backpack_asset_sha256() {
+  # From the SHA256SUMS published with BackPack ${BACKPACK_VERSION}.
+  case "$1" in
+    backpack_linux_amd64.tar.gz) echo "8d579a13ac2863cec45131e01dbae90a79305b18c134eaf803b68237e719aafc" ;;
+    backpack_linux_arm64.tar.gz) echo "e085e0ad031e4a77d3bc3acb96a802d590ae402077ebaa22f6b2ff6cee0bc2aa" ;;
+    backpack_linux_armv7.tar.gz) echo "72c8d5e76bcdfa7d4fa0b95aaa081f32ee2a83250adb993d56eb85f11a13b0b8" ;;
+    backpack_linux_386.tar.gz) echo "63b45484b8c14ea9ed229b18d217a4cc3259d94ca96be5c3a40159be37e4865e" ;;
+    *) return 1 ;;
+  esac
+}
+
+install_backpack_runtime() {
+  if [[ -x "$BACKPACK_BIN" && "$(cat "${INSTALL_DIR}/backpack.version" 2>/dev/null)" == "$BACKPACK_VERSION" ]]; then
+    return 0
+  fi
+  require_root
+  local asset expected actual tmp archive="" candidate bin
+  asset="$(backpack_arch_asset)" || return 1
+  expected="$(backpack_asset_sha256 "$asset")" || { fail "No pinned checksum for ${asset}."; return 1; }
+  tmp="$(mktemp -d)"
+
+  # Servers inside Iran often cannot reach GitHub, so a copied archive is accepted too.
+  for candidate in "${SUTUN_BACKPACK_ARCHIVE:-}" "/root/${asset}" "${INSTALL_DIR}/${asset}"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+      info "Using local BackPack archive: ${candidate}"
+      cp -f "$candidate" "${tmp}/${asset}"
+      archive="${tmp}/${asset}"
+      break
+    fi
+  done
+  if [[ -z "$archive" ]]; then
+    local url="https://github.com/AminMGMT/BackPack/releases/download/${BACKPACK_VERSION}/${asset}"
+    local curl_opts=(-fL --retry 3 --connect-timeout 10)
+    if [[ -t 1 ]]; then
+      curl_opts+=(--progress-bar)
+    else
+      curl_opts+=(-sS)
+    fi
+    info "Downloading BackPack ${BACKPACK_VERSION} for $(uname -m)..."
+    if ! curl "${curl_opts[@]}" "$url" -o "${tmp}/${asset}"; then
+      fail "Download failed: ${url}"
+      warn "Offline install: copy ${asset} from the ${BACKPACK_VERSION} release to /root/ and retry."
+      rm -rf -- "$tmp"
+      return 1
+    fi
+    archive="${tmp}/${asset}"
+  fi
+
+  actual="$(sha256sum "$archive" | awk '{print $1}')"
+  if [[ "${actual,,}" != "$expected" ]]; then
+    fail "BackPack archive checksum verification failed. Nothing was installed."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  ok "BackPack archive SHA-256 verified."
+
+  tar -xzf "$archive" -C "$tmp"
+  bin="$(find "$tmp" -type f -name backpack | head -n1)"
+  if [[ -z "$bin" ]]; then
+    fail "BackPack binary not found in archive."
+    rm -rf -- "$tmp"
+    return 1
+  fi
+  mkdir -p "$BIN_DIR"
+  install -m 0755 "$bin" "$BACKPACK_BIN"
+  printf '%s\n' "$BACKPACK_VERSION" > "${INSTALL_DIR}/backpack.version"
+  rm -rf -- "$tmp"
+  ok "BackPack ${BACKPACK_VERSION} installed for ICMP/PCK links."
+}
+
+write_icmp_service_template() {
+  cat > "$ICMP_SERVICE_TEMPLATE" <<EOF_ICMP_SVC
+[Unit]
+Description=SuTun BackPack link %i (ICMP/PCK)
+Documentation=https://github.com/AminMGMT/BackPack
+Wants=network-online.target
+After=network-online.target
+Before=sutun.service
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=${BACKPACK_BIN} -c ${ICMP_LINK_DIR}/%i.toml
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+SyslogIdentifier=sutun-icmp-%i
+
+[Install]
+WantedBy=multi-user.target
+EOF_ICMP_SVC
+}
+
+# Print "<dialer address>\t<listener address>" for a link index.
+icmp_link_addrs() {
+  local idx="$1" third fourth
+  third=$(( idx / 64 ))
+  fourth=$(( (idx % 64) * 4 ))
+  printf '%s\t%s\n' "${ICMP_LINK_PREFIX}.${third}.$(( fourth + 1 ))" "${ICMP_LINK_PREFIX}.${third}.$(( fourth + 2 ))"
+}
+
+valid_icmp_link_name() { [[ "$1" =~ ^(in|out)-[0-9]{1,5}$ ]]; }
+valid_icmp_token() { [[ "$1" =~ ^[A-Za-z0-9]{16,128}$ ]]; }
+valid_icmp_index() { [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 <= ICMP_LINK_MAX_INDEX )); }
+valid_icmp_host() { [[ "$1" =~ ^[A-Za-z0-9.-]{1,253}$ || "$1" =~ ^[0-9A-Fa-f:]{2,39}$ ]]; }
+
+# Print the link index already used by another link file, if any.
+icmp_index_owner() {
+  local idx="$1" env
+  for env in "$ICMP_LINK_DIR"/*.env; do
+    [[ -f "$env" ]] || continue
+    if grep -qx "LINK_INDEX=$(( 10#$idx ))" "$env"; then
+      basename "$env" .env
+      return 0
+    fi
+  done
+  return 1
+}
+
+icmp_free_index() {
+  local idx _
+  for _ in {1..64}; do
+    idx=$(( ((RANDOM << 15) | RANDOM) % (ICMP_LINK_MAX_INDEX + 1) ))
+    if ! icmp_index_owner "$idx" >/dev/null; then
+      echo "$idx"
+      return 0
+    fi
+  done
+  fail "No free ICMP link address was found."
+  return 1
+}
+
+save_icmp_link() {
+  local name="$1" role="$2" host="$3" link_port="$4" token="$5" idx="$6" carrier="${7:-xdi}"
+  local dial_ip listen_ip local_ip peer_ip
+  idx=$(( 10#$idx ))
+  IFS=$'\t' read -r dial_ip listen_ip < <(icmp_link_addrs "$idx")
+  if [[ "$role" == "listen" ]]; then
+    local_ip="$listen_ip"
+    peer_ip="$dial_ip"
+  else
+    local_ip="$dial_ip"
+    peer_ip="$listen_ip"
+  fi
+  mkdir -p "$ICMP_LINK_DIR"
+  chmod 0700 "$ICMP_LINK_DIR" 2>/dev/null || true
+  (
+    umask 077
+    {
+      printf 'LINK_NAME=%q\n' "$name"
+      printf 'ROLE=%q\n' "$role"
+      printf 'PEER_HOST=%q\n' "$host"
+      printf 'LINK_PORT=%q\n' "$link_port"
+      printf 'TOKEN=%q\n' "$token"
+      printf 'LINK_INDEX=%q\n' "$idx"
+      printf 'CARRIER=%q\n' "$carrier"
+      printf 'LOCAL_IP=%q\n' "$local_ip"
+      printf 'PEER_IP=%q\n' "$peer_ip"
+      printf 'IFACE=%q\n' "xrmi${idx}"
+      printf 'CLAIMED=%q\n' "no"
+    } > "${ICMP_LINK_DIR}/${name}.env"
+  )
+}
+
+# The upper-case names come from the sourced link file.
+# shellcheck disable=SC2153
+generate_icmp_link_toml() {
+  local env="$1" addr carrier_opts=""
+  unset LINK_NAME ROLE PEER_HOST LINK_PORT TOKEN LINK_INDEX CARRIER LOCAL_IP PEER_IP IFACE CLAIMED
+  # shellcheck disable=SC1090
+  source "$env"
+  # Links written before PCK existed have no CARRIER and are ICMP links.
+  CARRIER="${CARRIER:-xdi}"
+  if [[ "$CARRIER" == "pck" ]]; then
+    carrier_opts="mtu      = ${PCK_LINK_MTU}"$'\n'
+  fi
+  if [[ "$ROLE" == "listen" ]]; then
+    addr="0.0.0.0:${LINK_PORT}"
+  elif [[ "$PEER_HOST" == *:* ]]; then
+    addr="[${PEER_HOST}]:${LINK_PORT}"
+  else
+    addr="${PEER_HOST}:${LINK_PORT}"
+  fi
+  (
+    umask 077
+    cat > "${ICMP_LINK_DIR}/${LINK_NAME}.toml" <<EOF_ICMP_TOML
+# Generated by SuTun from ${LINK_NAME}.env; edits here are overwritten.
+[l3]
+mode     = "${ROLE}"
+addr     = "${addr}"
+token    = "${TOKEN}"
+carrier  = "${CARRIER}"
+iface    = "${IFACE}"
+local_ip = "${LOCAL_IP}/30"
+peer_ip  = "${PEER_IP}"
+EOF_ICMP_TOML
+    # Carrier-specific keys go after the shared ones, so ICMP link files stay byte-identical.
+    [[ -z "$carrier_opts" ]] || printf '%s' "$carrier_opts" >> "${ICMP_LINK_DIR}/${LINK_NAME}.toml"
+  )
+}
+
+icmp_link_units() {
+  systemctl list-units --all --plain --no-legend 'sutun-icmp@*' 2>/dev/null | awk '{print $1}'
+}
+
+apply_icmp_links() {
+  require_root
+  local env name unit old_sum new_sum
+  local -a names=()
+  for env in "$ICMP_LINK_DIR"/*.env; do
+    [[ -f "$env" ]] && names+=("$(basename "$env" .env)")
+  done
+
+  # Stop links whose definition was removed.
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    name="${unit#sutun-icmp@}"
+    name="${name%.service}"
+    [[ -f "${ICMP_LINK_DIR}/${name}.env" ]] || systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done < <(icmp_link_units)
+
+  ((${#names[@]})) || return 0
+  install_backpack_runtime || return 1
+  # Without iptables a pck link comes up but drops under load: BackPack needs it to drop the
+  # kernel's RSTs for the link's port and to keep the port out of connection tracking.
+  if grep -qx 'CARRIER=pck' "$ICMP_LINK_DIR"/*.env 2>/dev/null && ! command -v iptables >/dev/null 2>&1; then
+    install_iptables_runtime || warn "iptables is missing; PCK links will be unreliable until it is installed."
+  fi
+  write_icmp_service_template
+  systemctl daemon-reload
+
+  local failed=0
+  for name in "${names[@]}"; do
+    old_sum="$(sha256sum "${ICMP_LINK_DIR}/${name}.toml" 2>/dev/null | awk '{print $1}')"
+    generate_icmp_link_toml "${ICMP_LINK_DIR}/${name}.env"
+    new_sum="$(sha256sum "${ICMP_LINK_DIR}/${name}.toml" | awk '{print $1}')"
+    unit="sutun-icmp@${name}.service"
+    systemctl enable "$unit" >/dev/null 2>&1 || true
+    # A running link is only restarted when its definition changed, so node restarts do not drop it.
+    if [[ "$old_sum" != "$new_sum" ]] && systemctl is-active --quiet "$unit"; then
+      systemctl restart "$unit" || failed=1
+    else
+      systemctl start "$unit" || failed=1
+    fi
+  done
+  return "$failed"
+}
+
+# A listen link is claimed once a server has sent packets across it; the claim is kept.
+icmp_link_claimed() {
+  local env="$1" rx
+  unset ROLE IFACE CLAIMED
+  # shellcheck disable=SC1090
+  source "$env"
+  [[ "${CLAIMED:-no}" == "yes" ]] && return 0
+  rx="$(cat "/sys/class/net/${IFACE}/statistics/rx_packets" 2>/dev/null || echo 0)"
+  if [[ "$rx" =~ ^[0-9]+$ ]] && (( rx > 0 )); then
+    sed -i 's/^CLAIMED=.*/CLAIMED=yes/' "$env"
+    return 0
+  fi
+  return 1
+}
+
+# Print the carrier of a link file (links from before PCK are ICMP links).
+icmp_link_carrier() {
+  local carrier
+  carrier="$(sed -n 's/^CARRIER=//p' "$1" 2>/dev/null | head -n1)"
+  echo "${carrier:-xdi}"
+}
+
+# Print the name of the pck link listening on a TCP port, if any.
+pck_link_port_owner() {
+  local port="$1" env
+  for env in "$ICMP_LINK_DIR"/*.env; do
+    [[ -f "$env" ]] || continue
+    [[ "$(icmp_link_carrier "$env")" == "pck" ]] || continue
+    grep -qx 'ROLE=listen' "$env" || continue
+    if grep -qx "LINK_PORT=$(( 10#$port ))" "$env"; then
+      basename "$env" .env
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Fail when any listen port of a tunnel port spec is taken by a pck link.
+check_pck_link_ports() {
+  local port_spec="$1" port owner
+  while IFS= read -r port; do
+    [[ -n "$port" ]] || continue
+    if owner="$(pck_link_port_owner "$port")"; then
+      fail "TCP port ${port} is used by the PCK link '${owner}'."
+      return 1
+    fi
+  done < <(expand_port_spec "$port_spec")
+  return 0
+}
+
+# True when a TCP port can carry a pck link: nothing listens on it and no tunnel or link claims it.
+pck_port_available() {
+  local port="$1" dir env
+  [[ -n "$(ss -H -ltn "sport = :${port}" 2>/dev/null || true)" ]] && return 1
+  if [[ -f "$CONFIG_FILE" ]] && grep -qx "PORT=${port}" "$CONFIG_FILE"; then
+    return 1
+  fi
+  pck_link_port_owner "$port" >/dev/null && return 1
+  for dir in "$HAPROXY_TUNNEL_DIR" "$IPTABLES_TUNNEL_DIR" "$GOST_TUNNEL_DIR" "$REALM_TUNNEL_DIR"; do
+    for env in "$dir"/*.env; do
+      [[ -f "$env" ]] || continue
+      local spec
+      spec="$(bash -c 'source "$1" >/dev/null 2>&1; printf "%s" "${PORT_SPEC:-}"' _ "$env")"
+      [[ -n "$spec" ]] || continue
+      # grep reads every line (no -q): exiting early would SIGPIPE the writer and fail under pipefail.
+      expand_port_spec "$spec" 2>/dev/null | grep -x "$port" >/dev/null && return 1
+    done
+  done
+  return 0
+}
+
+pck_free_port() {
+  local port _
+  for _ in {1..64}; do
+    port=$(( PCK_PORT_MIN + ((RANDOM << 15) | RANDOM) % (PCK_PORT_MAX - PCK_PORT_MIN + 1) ))
+    if pck_port_available "$port"; then
+      echo "$port"
+      return 0
+    fi
+  done
+  fail "No free TCP port was found for a PCK link."
+  return 1
+}
+
+# Print the invite details of an unclaimed listen link of a carrier, creating one when none is left.
+ensure_icmp_listen_link() {
+  require_root
+  local carrier="${1:-xdi}" env pending="" idx token link_port
+  if ! valid_backpack_carrier "$carrier"; then
+    fail "Unknown BackPack carrier '${carrier}'."
+    return 1
+  fi
+  for env in "$ICMP_LINK_DIR"/*.env; do
+    [[ -f "$env" ]] || continue
+    grep -qx 'ROLE=listen' "$env" || continue
+    [[ "$(icmp_link_carrier "$env")" == "$carrier" ]] || continue
+    if ! icmp_link_claimed "$env"; then
+      pending="$env"
+      break
+    fi
+  done
+
+  if [[ -z "$pending" ]]; then
+    idx="$(icmp_free_index)" || return 1
+    if [[ "$carrier" == "pck" ]]; then
+      link_port="$(pck_free_port)" || return 1
+    else
+      link_port="$(( 20000 + idx ))"
+    fi
+    token="$(openssl rand -hex 24)"
+    save_icmp_link "in-${idx}" "listen" "" "$link_port" "$token" "$idx" "$carrier"
+    pending="${ICMP_LINK_DIR}/in-${idx}.env"
+    if ! apply_icmp_links; then
+      fail "The ${carrier} link service failed to start."
+      rm -f "$pending" "${pending%.env}.toml"
+      apply_icmp_links >/dev/null 2>&1 || true
+      return 1
+    fi
+  fi
+
+  unset TOKEN LINK_PORT LINK_INDEX
+  # shellcheck disable=SC1090
+  source "$pending"
+  printf '{"t":"%s","p":%d,"i":%d}\n' "$TOKEN" "$LINK_PORT" "$LINK_INDEX"
+}
+
+# Create (or reuse) the dialling end of a link from invite details and print its peer address.
+create_icmp_dial_link() {
+  require_root
+  local host="$1" link_port="$2" token="$3" idx="$4" carrier="${5:-xdi}" name owner
+  if ! valid_icmp_host "$host" || ! valid_port "$link_port" || ! valid_icmp_token "$token" || ! valid_icmp_index "$idx" || ! valid_backpack_carrier "$carrier"; then
+    fail "The BackPack link details in the invite are invalid."
+    return 1
+  fi
+  idx=$(( 10#$idx ))
+  name="out-${idx}"
+  owner="$(icmp_index_owner "$idx" || true)"
+  if [[ -n "$owner" && "$owner" != "$name" ]]; then
+    fail "This invite's link address is already used by link '${owner}'. Generate a new invite on the other server."
+    return 1
+  fi
+
+  local previous=""
+  [[ -f "${ICMP_LINK_DIR}/${name}.env" ]] && previous="$(cat "${ICMP_LINK_DIR}/${name}.env")"
+  save_icmp_link "$name" "dial" "$host" "$link_port" "$token" "$idx" "$carrier"
+  if ! apply_icmp_links; then
+    fail "The ${carrier} link service failed to start."
+    if [[ -n "$previous" ]]; then
+      printf '%s\n' "$previous" > "${ICMP_LINK_DIR}/${name}.env"
+    else
+      rm -f "${ICMP_LINK_DIR}/${name}.env" "${ICMP_LINK_DIR}/${name}.toml"
+    fi
+    apply_icmp_links >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  unset PEER_IP
+  # shellcheck disable=SC1090
+  source "${ICMP_LINK_DIR}/${name}.env"
+  printf '{"name":"%s","peer_ip":"%s"}\n' "$name" "$PEER_IP"
+}
+
+delete_icmp_link() {
+  require_root
+  local name="$1"
+  if ! valid_icmp_link_name "$name" || [[ ! -f "${ICMP_LINK_DIR}/${name}.env" ]]; then
+    fail "Link '${name}' does not exist."
+    return 1
+  fi
+  unset ROLE PEER_IP
+  # shellcheck disable=SC1090
+  source "${ICMP_LINK_DIR}/${name}.env"
+  systemctl disable --now "sutun-icmp@${name}.service" >/dev/null 2>&1 || true
+  rm -f "${ICMP_LINK_DIR}/${name}".*
+
+  # The mesh peer that pointed across this link has nowhere to go any more.
+  if [[ "$ROLE" == "dial" && -f "$CONFIG_FILE" ]]; then
+    local peers kept="" p tmp
+    local -a peer_list=()
+    peers="$(bash -c 'source "$1" >/dev/null 2>&1; printf "%s" "${PEERS:-}"' _ "$CONFIG_FILE")"
+    IFS=',' read -ra peer_list <<< "$peers"
+    for p in "${peer_list[@]}"; do
+      [[ -z "$p" || "$p" == *"//${PEER_IP}:"* ]] && continue
+      kept+="${kept:+,}${p}"
+    done
+    if [[ "$kept" != "$peers" ]]; then
+      tmp="$(mktemp)"
+      grep -v '^PEERS=' "$CONFIG_FILE" > "$tmp" || true
+      printf 'PEERS=%q\n' "$kept" >> "$tmp"
+      chmod 600 "$tmp"
+      mv -f "$tmp" "$CONFIG_FILE"
+      info "Removed the mesh peer ${PEER_IP}; restart the node to apply it."
+    fi
+  fi
+  ok "Link '${name}' deleted."
+}
+
+# Print the public address of the server this one joined over a BackPack link, if any.
+backpack_joined_via() {
+  [[ -d "$ICMP_LINK_DIR" ]] || return 0
+  local env peers
+  peers="$( (grep -E '^PEERS=' "$CONFIG_FILE" 2>/dev/null || true) | head -n1)"
+  for env in "$ICMP_LINK_DIR"/out-*.env; do
+    [[ -f "$env" ]] || continue
+    unset PEER_IP PEER_HOST
+    # shellcheck disable=SC1090
+    source "$env"
+    if [[ -n "${PEER_IP:-}" && "$peers" == *"//${PEER_IP}:"* ]]; then
+      echo "${PEER_HOST:-}"
+      return 0
+    fi
+  done
+}
+
+# Remove dialling links that no configured peer uses any more (e.g. after joining another mesh).
+prune_icmp_links() {
+  [[ -d "$ICMP_LINK_DIR" ]] || return 0
+  local env peers
+  peers="$( (grep -E '^PEERS=' "$CONFIG_FILE" 2>/dev/null || true) | head -n1)"
+  for env in "$ICMP_LINK_DIR"/out-*.env; do
+    [[ -f "$env" ]] || continue
+    unset LINK_NAME PEER_IP
+    # shellcheck disable=SC1090
+    source "$env"
+    [[ "$peers" == *"//${PEER_IP}:"* ]] || delete_icmp_link "$LINK_NAME" >/dev/null
+  done
+}
+
+remove_all_icmp_links() {
+  local unit
+  while read -r unit; do
+    [[ -n "$unit" ]] || continue
+    systemctl disable --now "$unit" >/dev/null 2>&1 || true
+  done < <(icmp_link_units)
+  rm -rf -- "$ICMP_LINK_DIR"
+  rm -f "$ICMP_SERVICE_TEMPLATE"
+}
+
+list_icmp_links() {
+  local env state rx tx kind
+  if ! compgen -G "${ICMP_LINK_DIR}/*.env" >/dev/null; then
+    info "No ICMP/PCK links on this server."
+    return 0
+  fi
+  printf '  %-10s %-6s %-7s %-22s %-16s %-10s %s\n' "LINK" "TYPE" "ROLE" "REMOTE" "PEER (TUNNEL)" "STATE" "RX/TX PACKETS"
+  for env in "$ICMP_LINK_DIR"/*.env; do
+    [[ -f "$env" ]] || continue
+    unset LINK_NAME ROLE PEER_HOST LINK_PORT PEER_IP IFACE CLAIMED CARRIER
+    # shellcheck disable=SC1090
+    source "$env"
+    if [[ "${CARRIER:-xdi}" == "pck" ]]; then kind="PCK"; else kind="ICMP"; fi
+    state="$(systemctl is-active "sutun-icmp@${LINK_NAME}.service" 2>/dev/null || echo inactive)"
+    rx="$(cat "/sys/class/net/${IFACE}/statistics/rx_packets" 2>/dev/null || echo -)"
+    tx="$(cat "/sys/class/net/${IFACE}/statistics/tx_packets" 2>/dev/null || echo -)"
+    if [[ "$ROLE" == "listen" && "$CLAIMED" != "yes" ]]; then
+      PEER_HOST="(waiting for invite)"
+    elif [[ "$ROLE" == "listen" && "$kind" == "PCK" ]]; then
+      PEER_HOST="any (tcp/${LINK_PORT})"
+    fi
+    printf '  %-10s %-6s %-7s %-22s %-16s %-10s %s/%s\n' "$LINK_NAME" "$kind" "$ROLE" "${PEER_HOST:-any}" "$PEER_IP" "$state" "$rx" "$tx"
+  done
+}
+
+ensure_sutun_cli() {
+  local target="${INSTALL_DIR}/sutun.sh"
+  mkdir -p "$INSTALL_DIR"
+  local current_source="${BASH_SOURCE[0]:-}"
+
+  if [[ -n "$current_source" && -f "$current_source" && "$current_source" != /dev/fd/* && "$current_source" != /proc/* ]]; then
+    # Never downgrade: an older copy run by hand would leave the newer web panel without its commands.
+    if [[ "$current_source" != "$target" ]] && ! installed_script_is_newer; then
+      install -m 0755 "$current_source" "$target" 2>/dev/null || cp -f "$current_source" "$target" 2>/dev/null || true
+    fi
+  else
+    local branch; branch="$(get_active_branch)" ts
+    ts="$(date +%s)"
+    local tmp_sh
+    tmp_sh="$(mktemp)"
+    if curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --connect-timeout 5 --max-time 15 \
+      "https://raw.githubusercontent.com/mdjes/SuTun/${branch}/sutun.sh?t=${ts}" \
+      -o "$tmp_sh" 2>/dev/null && [[ -s "$tmp_sh" ]]; then
+      install -m 0755 "$tmp_sh" "$target" 2>/dev/null || cp -f "$tmp_sh" "$target" 2>/dev/null || true
+      chmod 0755 "$target" 2>/dev/null || true
+    fi
+    rm -f "$tmp_sh"
+  fi
+
+  if [[ -f "$target" ]]; then
+    chmod 0755 "$target" 2>/dev/null || true
+    ln -sf "$target" /usr/local/bin/sutun 2>/dev/null || true
+  fi
+}
+
+download_file_with_mirrors() {
+  local target_path="$1"
+  local rel_path="$2"
+  local mode="${3:-0644}"
+  local branch; branch="$(get_active_branch)"
+  local -a urls
+  mapfile -t urls < <(release_mirror_urls "$rel_path" "$branch")
+
+  local tmp
+  tmp="$(mktemp)"
+  local success=0
+
+  for url in "${urls[@]}"; do
+    if curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      --connect-timeout 6 --max-time 35 --retry 1 \
+      "$url" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      # Sanity check: Ensure we didn't download an HTML error page when expecting python/bash/script
+      if grep -qi "<html" "$tmp" 2>/dev/null && [[ "$rel_path" != *"index.html"* ]]; then
+        continue
+      fi
+      install -m "$mode" "$tmp" "$target_path" 2>/dev/null || cp -f "$tmp" "$target_path" 2>/dev/null || true
+      chmod "$mode" "$target_path" 2>/dev/null || true
+      success=1
+      break
+    fi
+  done
+  rm -f "$tmp"
+  return $(( 1 - success ))
+}
+
+update_web_assets() {
+  mkdir -p "${WEB_DIR}/static" "${INSTALL_DIR}" /etc/sutun
+  local branch; branch="$(get_active_branch)" updated=0
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  # 1. Install the running copy of the CLI script, unless the installed one is newer.
+  local target_sh="${INSTALL_DIR}/sutun.sh"
+  if [[ -f "${script_dir}/sutun.sh" && "${script_dir}/sutun.sh" != "$target_sh" ]] && ! installed_script_is_newer; then
+    install -m 0755 "${script_dir}/sutun.sh" "$target_sh" 2>/dev/null || cp -f "${script_dir}/sutun.sh" "$target_sh" 2>/dev/null || true
+    ln -sf "$target_sh" /usr/local/bin/sutun 2>/dev/null || true
+    updated=1
+  fi
+
+  # 2. The web server and panel must be the same release as the CLI script, or the
+  # panel calls commands the script does not have. Newer releases come only through
+  # the verified update (sutun node-update), which replaces all three together.
+  local cli_version stage rel mode local_copy
+  cli_version="$(installed_version)"
+  stage="$(mktemp -d)"
+  for rel in web/server.py web/static/index.html; do
+    stage_file_ok "${INSTALL_DIR}/${rel}" "$rel" "$cli_version" && continue
+    mode=0755
+    [[ "$rel" == "web/static/index.html" ]] && mode=0644
+    local_copy="${script_dir}/${rel}"
+    if fetch_release_file "${stage}/${rel}" "$rel" "$branch" "$cli_version" ||
+      { [[ "$local_copy" != "${INSTALL_DIR}/${rel}" ]] && stage_file_ok "$local_copy" "$rel" "$cli_version" &&
+        mkdir -p "$(dirname "${stage}/${rel}")" && cp -f "$local_copy" "${stage}/${rel}"; }; then
+      install_staged_file "${stage}/${rel}" "${INSTALL_DIR}/${rel}" "$mode" && updated=1
+    else
+      warn "No copy of ${rel} for ${cli_version} was found; run 'sutun node-update' to update everything."
+    fi
+  done
+  rm -rf -- "$stage"
+
+  # 3. Always regenerate runner and services
+  local runner_before runner_after
+  runner_before="$(sha256sum "${INSTALL_DIR}/sutun-runner" 2>/dev/null)"
+  write_runner
+  write_iperf_service
+  systemctl daemon-reload 2>/dev/null || true
+  runner_after="$(sha256sum "${INSTALL_DIR}/sutun-runner" 2>/dev/null)"
+
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    if grep -q '^SUTUN_BRANCH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+      sed -i "s|^SUTUN_BRANCH=.*|SUTUN_BRANCH=\"${branch}\"|" "$WEB_CONFIG_FILE"
+    else
+      echo "SUTUN_BRANCH=\"${branch}\"" >> "$WEB_CONFIG_FILE"
+    fi
+  fi
+
+  if [[ -f "$WEB_SERVICE_FILE" ]]; then
+    write_web_services
+  fi
+
+  if (( updated )); then
+    ok "Core CLI, runner, and Web UI assets updated successfully."
+  fi
+
+  # 4. Restart the mesh asynchronously, only when the runner changed, so the new
+  # runner takes effect. Opening the menu or a login link must not drop the mesh.
+  if [[ "$runner_before" != "$runner_after" ]] && systemctl is-active --quiet sutun.service 2>/dev/null; then
+    ( sleep 1 && systemctl restart sutun.service ) >/dev/null 2>&1 &
+  fi
+
+
+  # 5. Restart web service asynchronously to avoid killing the updater process mid-execution (prevents deadlock)
+  if (( updated )) && systemctl is-active --quiet sutun-web.service 2>/dev/null; then
+    ( sleep 2 && systemctl restart sutun-web.service ) >/dev/null 2>&1 &
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Safe self-update
+# Files are downloaded to a staging directory and verified (syntax + exact
+# release version) before anything is replaced. The previous files are backed
+# up, and if the restarted services are not healthy they are restored.
+# Progress is written to UPDATE_STATUS_FILE so the web panel can follow it.
+# ---------------------------------------------------------------------------
+
+release_mirror_urls() {
+  local rel_path="$1" branch="$2" ts
+  ts="$(date +%s)"
+  printf '%s\n' \
+    "https://raw.githubusercontent.com/mdjes/SuTun/${branch}/${rel_path}?t=${ts}" \
+    "https://cdn.jsdelivr.net/gh/mdjes/SuTun@${branch}/${rel_path}" \
+    "https://fastly.jsdelivr.net/gh/mdjes/SuTun@${branch}/${rel_path}" \
+    "https://raw.gitmirror.com/mdjes/SuTun/${branch}/${rel_path}"
+}
+
+# Exit 0 when version $1 is newer than $2 (same rules as is_newer_version in web/server.py).
+version_is_newer() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+
+def parse(v):
+    m = re.match(r'^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-?([a-zA-Z]+)(?:\.?(\d+))?)?', str(v).strip().lstrip('v'))
+    if not m:
+        return (0, 0, 0, 0, "", 0)
+    tag = m.group(4)
+    return (int(m.group(1) or 0), int(m.group(2) or 0), int(m.group(3) or 0),
+            1 if tag is None else 0, (tag or "").lower(), int(m.group(5) or 0))
+
+
+sys.exit(0 if parse(sys.argv[1]) > parse(sys.argv[2]) else 1)
+PY
+}
+
+# Version of the installed CLI, which may differ from $VERSION when this
+# script was piped from GitHub (bash <(curl ...) update).
+installed_version() {
+  local v=""
+  if [[ -f "${INSTALL_DIR}/sutun.sh" ]]; then
+    v="$(sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "${INSTALL_DIR}/sutun.sh" | head -n1)"
+  fi
+  printf '%s\n' "${v:-$VERSION}"
+}
+
+# True when the installed CLI script is a newer release than this running copy,
+# e.g. an old downloaded sutun.sh being run by hand after an update.
+installed_script_is_newer() {
+  version_is_newer "$(installed_version)" "$VERSION"
+}
+
+# update_status <state> <step> [error] [rolled_back]
+update_status() {
+  local state="$1" step="$2" error="${3:-}" rolled_back="${4:-false}"
+  mkdir -p "$(dirname "$UPDATE_STATUS_FILE")" 2>/dev/null || true
+  python3 - "$UPDATE_STATUS_FILE" "$state" "$step" "$error" "$rolled_back" \
+    "${UPDATE_FROM:-}" "${UPDATE_TARGET:-}" "${UPDATE_BRANCH:-}" <<'PY' || true
+import json
+import os
+import sys
+import time
+
+path, state, step, error, rolled_back, from_v, target_v, branch = sys.argv[1:9]
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+now = int(time.time())
+# A job queued by the web panel keeps its start time; anything else starts now.
+if state == "running" and data.get("state") not in ("queued", "running"):
+    data["started_at"] = now
+data.setdefault("started_at", now)
+data.update({
+    "state": state,
+    "step": step,
+    "error": error,
+    "rolled_back": rolled_back == "true",
+    "from_version": from_v,
+    "target_version": target_v,
+    "branch": branch,
+    "updated_at": now,
+})
+if state in ("success", "failed", "up_to_date"):
+    data["finished_at"] = now
+else:
+    data.pop("finished_at", None)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f)
+os.replace(tmp, path)
+PY
+}
+
+# Highest release version any mirror reports for the branch (mirrors can lag).
+fetch_release_version() {
+  local branch="$1" url tmp v best=""
+  local -a urls
+  mapfile -t urls < <(release_mirror_urls "version.json" "$branch")
+  tmp="$(mktemp)"
+  for url in "${urls[@]}"; do
+    if curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      --connect-timeout 6 --max-time 20 "$url" -o "$tmp" 2>/dev/null; then
+      v="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("version", ""))' "$tmp" 2>/dev/null || true)"
+      if [[ "$v" =~ ^[0-9]+\.[0-9]+ ]] && { [[ -z "$best" ]] || version_is_newer "$v" "$best"; }; then
+        best="$v"
+      fi
+    fi
+  done
+  rm -f "$tmp"
+  [[ -n "$best" ]] || return 1
+  printf '%s\n' "$best"
+}
+
+# A staged file must parse and carry exactly the expected release version,
+# so a lagging mirror can never mix files from two releases.
+stage_file_ok() {
+  local file="$1" rel_path="$2" expected="$3"
+  [[ -s "$file" ]] || return 1
+  case "$rel_path" in
+    sutun.sh)
+      bash -n "$file" 2>/dev/null || return 1
+      [[ "$(sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "$file" | head -n1)" == "$expected" ]]
+      ;;
+    web/server.py)
+      python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$file" 2>/dev/null || return 1
+      [[ "$(sed -n 's/^CURRENT_VERSION = "\(.*\)"$/\1/p' "$file" | head -n1)" == "$expected" ]]
+      ;;
+    web/static/index.html)
+      grep -qi '<html' "$file" && grep -qF "name=\"sutun-version\" content=\"${expected}\"" "$file"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+fetch_release_file() {
+  local target="$1" rel_path="$2" branch="$3" expected="$4" url
+  local -a urls
+  mapfile -t urls < <(release_mirror_urls "$rel_path" "$branch")
+  mkdir -p "$(dirname "$target")"
+  for url in "${urls[@]}"; do
+    if curl -fsSL -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+      --connect-timeout 6 --max-time 90 --retry 1 "$url" -o "$target" 2>/dev/null \
+      && stage_file_ok "$target" "$rel_path" "$expected"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+update_app_files() {
+  printf '%s\n' "${INSTALL_DIR}/sutun.sh" "${WEB_DIR}/server.py" \
+    "${WEB_DIR}/static/index.html" "${INSTALL_DIR}/sutun-runner"
+}
+
+backup_app_files() {
+  local backup="$1" f
+  mkdir -p "$backup" || return 1
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    mkdir -p "${backup}$(dirname "$f")" && cp -p "$f" "${backup}${f}" || return 1
+  done < <(update_app_files)
+}
+
+restore_app_files() {
+  local backup="$1" f
+  while IFS= read -r f; do
+    [[ -f "${backup}${f}" ]] || continue
+    cp -p "${backup}${f}" "${f}.restore" && mv -f "${f}.restore" "$f"
+  done < <(update_app_files)
+}
+
+prune_update_backups() {
+  local old
+  [[ -d "$UPDATE_BACKUP_DIR" ]] || return 0
+  while IFS= read -r old; do
+    [[ -n "$old" ]] && rm -rf -- "$old"
+  done < <(find "$UPDATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | tail -n +4 | cut -d' ' -f2-)
+}
+
+# mv onto a new inode, so the copy of this script that bash is executing is never overwritten.
+install_staged_file() {
+  local src="$1" dst="$2" mode="$3"
+  mkdir -p "$(dirname "$dst")" && install -m "$mode" "$src" "${dst}.new" && mv -f "${dst}.new" "$dst"
+}
+
+# Regenerate the runner and units with the freshly installed script's code.
+refresh_generated_files() {
+  bash "${INSTALL_DIR}/sutun.sh" write-runner >/dev/null 2>&1 || true
+  if [[ -f "$WEB_SERVICE_FILE" ]]; then
+    write_web_services >/dev/null 2>&1 || true
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+}
+
+inside_web_service() {
+  grep -q 'sutun-web.service' /proc/self/cgroup 2>/dev/null
+}
+
+# Wait until the web panel reports the target version and, if it was running
+# before, the mesh service is active again.
+update_services_healthy() {
+  local target="$1" mesh_expected="$2" port bind host scheme version="" i
+  port="$(get_web_port)"
+  bind="$(awk -F= '/^WEB_BIND=/ {gsub(/[" '\''\r\n]/, "", $2); print $2}' "$WEB_CONFIG_FILE" 2>/dev/null || true)"
+  host="127.0.0.1"
+  [[ -n "$bind" && "$bind" != "0.0.0.0" && "$bind" != *:* ]] && host="$bind"
+  for (( i = 0; i < 45; i++ )); do
+    sleep 1
+    if [[ -f "$WEB_SERVICE_FILE" ]]; then
+      version=""
+      for scheme in http https; do
+        version="$(curl -fsSk --max-time 3 "${scheme}://${host}:${port}/api/cluster/info" 2>/dev/null \
+          | python3 -c 'import json, sys; print(json.load(sys.stdin).get("version", ""))' 2>/dev/null || true)"
+        [[ "$version" == "$target" ]] && break
+      done
+      [[ "$version" == "$target" ]] || continue
+    fi
+    if (( mesh_expected )) && ! systemctl is-active --quiet sutun.service 2>/dev/null; then
+      continue
+    fi
+    return 0
+  done
+  return 1
+}
+
+restart_updated_services() {
+  local mesh_was_active="$1"
+  if (( mesh_was_active )); then
+    systemctl restart sutun.service >/dev/null 2>&1 || true
+  fi
+  systemctl restart sutun-iperf.service >/dev/null 2>&1 || true
+  if [[ -f "$WEB_SERVICE_FILE" ]]; then
+    systemctl restart sutun-web.service >/dev/null 2>&1 || true
+  fi
+}
+
+persist_update_branch() {
+  local branch="$1"
+  [[ -f "$WEB_CONFIG_FILE" ]] || return 0
+  if grep -q '^SUTUN_BRANCH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+    sed -i "s|^SUTUN_BRANCH=.*|SUTUN_BRANCH=\"${branch}\"|" "$WEB_CONFIG_FILE"
+  else
+    echo "SUTUN_BRANCH=\"${branch}\"" >> "$WEB_CONFIG_FILE"
+  fi
+}
+
+# Returns 0 on success or when already up to date, 3 when another update runs, 1 on failure.
+update_app_safe() {
+  local lock_fd stage backup rel mesh_was_active=0 mode
+  mkdir -p "$(dirname "$UPDATE_LOCK_FILE")" 2>/dev/null || true
+  exec {lock_fd}>"$UPDATE_LOCK_FILE"
+  if ! flock -n "$lock_fd"; then
+    fail "Another update is already running on this server."
+    return 3
+  fi
+  # Ctrl+C while the files are still downloading changes nothing; the hook records that.
+  UPDATE_CANCELLABLE=1
+  on_cancel update_cancel_cleanup
+
+  UPDATE_BRANCH="$(get_active_branch)"
+  UPDATE_FROM="$(installed_version)"
+  UPDATE_TARGET=""
+  update_status running download
+  info "Checking for a newer release..."
+
+  if ! UPDATE_TARGET="$(fetch_release_version "$UPDATE_BRANCH")"; then
+    UPDATE_TARGET=""
+    update_status failed download "Could not read the latest version from any mirror. Check this server's internet access."
+    fail "Could not read the latest version from any mirror."
+    UPDATE_CANCELLABLE=0
+    exec {lock_fd}>&-
+    return 1
+  fi
+
+  if [[ "${SUTUN_FORCE_UPDATE:-0}" != "1" ]] && ! version_is_newer "$UPDATE_TARGET" "$UPDATE_FROM"; then
+    update_status up_to_date complete
+    ok "Already up to date (${UPDATE_FROM}; latest release: ${UPDATE_TARGET})."
+    UPDATE_CANCELLABLE=0
+    exec {lock_fd}>&-
+    return 0
+  fi
+
+  stage="$(mktemp -d)"
+  UPDATE_STAGE_DIR="$stage"
+  for rel in sutun.sh web/server.py web/static/index.html; do
+    info "Downloading ${rel} (${UPDATE_TARGET})..."
+    if ! fetch_release_file "${stage}/${rel}" "$rel" "$UPDATE_BRANCH" "$UPDATE_TARGET"; then
+      update_status failed verify "Could not download a verified copy of ${rel} for ${UPDATE_TARGET}. Mirrors may still be syncing; try again in a few minutes."
+      fail "No mirror served a valid ${rel} for ${UPDATE_TARGET}. Nothing was changed."
+      rm -rf -- "$stage"
+      UPDATE_CANCELLABLE=0
+      UPDATE_STAGE_DIR=""
+      exec {lock_fd}>&-
+      return 1
+    fi
+  done
+  update_status running verify
+  ok "All files for ${UPDATE_TARGET} downloaded and verified."
+
+  UPDATE_CANCELLABLE=0
+  UPDATE_STAGE_DIR=""
+  # From the backup to the health check the update has to finish or roll back,
+  # so Ctrl+C is ignored (by the commands it runs too) until then.
+  info "Installing ${UPDATE_TARGET}. Ctrl+C is paused until the update finishes or rolls back."
+  local install_rc=0
+  trap '' INT
+  update_app_install || install_rc=$?
+  trap 'handle_interrupt' INT
+  return "$install_rc"
+}
+
+UPDATE_CANCELLABLE=0
+UPDATE_STAGE_DIR=""
+
+update_cancel_cleanup() {
+  (( UPDATE_CANCELLABLE )) || return 0
+  [[ -n "$UPDATE_STAGE_DIR" ]] && rm -rf -- "$UPDATE_STAGE_DIR"
+  update_status failed download "The update was cancelled before anything was changed."
+}
+
+# Second half of update_app_safe: backup, install, restart, health check and rollback.
+# It runs with Ctrl+C ignored and uses update_app_safe's local variables.
+update_app_install() {
+  # set -e is off inside "update_app_safe || ...", so every step below is checked explicitly.
+  update_status running backup
+  backup="${UPDATE_BACKUP_DIR}/$(date +%Y%m%d-%H%M%S)-${UPDATE_FROM}"
+  if ! backup_app_files "$backup"; then
+    update_status failed backup "Could not back up the current files to ${backup} (disk full?). Nothing was changed."
+    fail "Backup failed; nothing was changed."
+    rm -rf -- "$stage" "$backup"
+    exec {lock_fd}>&-
+    return 1
+  fi
+
+  update_status running install
+  for rel in sutun.sh web/server.py web/static/index.html; do
+    mode=0644
+    [[ "$rel" == "web/static/index.html" ]] || mode=0755
+    if ! install_staged_file "${stage}/${rel}" "${INSTALL_DIR}/${rel}" "$mode"; then
+      restore_app_files "$backup"
+      update_status failed install "Could not install ${rel}; the previous files were restored." true
+      fail "Installing ${rel} failed; the previous files were restored."
+      rm -rf -- "$stage"
+      exec {lock_fd}>&-
+      return 1
+    fi
+  done
+  rm -rf -- "$stage"
+  ln -sf "${INSTALL_DIR}/sutun.sh" /usr/local/bin/sutun 2>/dev/null || true
+  persist_update_branch "$UPDATE_BRANCH"
+  refresh_generated_files
+
+  update_status running restart
+  systemctl is-active --quiet sutun.service 2>/dev/null && mesh_was_active=1
+
+  if inside_web_service; then
+    # Restarting the web unit would kill this process, so hand the restart off
+    # and finish without a health check (only on hosts without systemd-run).
+    if (( mesh_was_active )); then
+      systemctl restart sutun.service >/dev/null 2>&1 || true
+    fi
+    update_status success complete
+    ok "Updated to ${UPDATE_TARGET}. The web panel restarts in a few seconds."
+    exec {lock_fd}>&-
+    ( sleep 3 && systemctl restart sutun-web.service ) >/dev/null 2>&1 &
+    return 0
+  fi
+
+  restart_updated_services "$mesh_was_active"
+  update_status running health
+  if update_services_healthy "$UPDATE_TARGET" "$mesh_was_active"; then
+    update_status success complete
+    prune_update_backups
+    ok "Updated ${UPDATE_FROM} -> ${UPDATE_TARGET}."
+    exec {lock_fd}>&-
+    return 0
+  fi
+
+  warn "The updated services did not come back healthy. Restoring ${UPDATE_FROM}..."
+  update_status running rollback
+  restore_app_files "$backup"
+  refresh_generated_files
+  restart_updated_services "$mesh_was_active"
+  update_status failed rollback \
+    "The services did not report ${UPDATE_TARGET} as healthy within 45 seconds, so ${UPDATE_FROM} was restored." true
+  fail "Update failed; ${UPDATE_FROM} was restored."
+  exec {lock_fd}>&-
+  return 1
+}
+
+# Update the EasyTier core if a newer release exists, restoring the previous
+# binaries when the mesh service does not start with the new ones.
+update_easytier_core_safe() {
+  local current_et latest_et latest_et_json tmp mesh_was_active=0
+  current_et="$(cat "${INSTALL_DIR}/easytier.version" 2>/dev/null || echo "0.0.0")"
+  current_et="${current_et#v}"
+  current_et="${current_et#V}"
+  latest_et_json="$(curl -fsSL --connect-timeout 5 --max-time 12 https://api.github.com/repos/EasyTier/EasyTier/releases/latest 2>/dev/null || true)"
+  latest_et=""
+  if [[ -n "$latest_et_json" ]]; then
+    latest_et="$(printf '%s' "$latest_et_json" | grep -Po '"tag_name":\s*"v?\K[0-9.]+' | head -n1 || true)"
+  fi
+  [[ -n "$latest_et" && "$latest_et" != "$current_et" ]] || return 0
+
+  info "Updating EasyTier core (${current_et} -> ${latest_et}). Ctrl+C is paused until it finishes."
+  # Swapping the binaries and restoring them on failure must not be cut short.
+  trap '' INT
+  systemctl is-active --quiet sutun.service 2>/dev/null && mesh_was_active=1
+  tmp="$(mktemp -d)"
+  cp -p "${BIN_DIR}/easytier-core" "${BIN_DIR}/easytier-cli" "${INSTALL_DIR}/easytier.version" "$tmp/" 2>/dev/null || true
+  if ! install_core; then
+    warn "EasyTier core update failed; keeping ${current_et}."
+    restore_easytier_binaries "$tmp"
+  elif (( mesh_was_active )); then
+    systemctl restart sutun.service >/dev/null 2>&1 || true
+    sleep 3
+    if ! systemctl is-active --quiet sutun.service 2>/dev/null; then
+      warn "The mesh service did not start with EasyTier ${latest_et}; restoring ${current_et}."
+      restore_easytier_binaries "$tmp"
+      systemctl restart sutun.service >/dev/null 2>&1 || true
+    fi
+  fi
+  rm -rf -- "$tmp"
+  trap 'handle_interrupt' INT
+}
+
+
+restore_easytier_binaries() {
+  local saved="$1"
+  [[ -f "$saved/easytier-core" ]] && cp -p "$saved/easytier-core" "${BIN_DIR}/easytier-core"
+  [[ -f "$saved/easytier-cli" ]] && cp -p "$saved/easytier-cli" "${BIN_DIR}/easytier-cli"
+  [[ -f "$saved/easytier.version" ]] && cp -p "$saved/easytier.version" "${INSTALL_DIR}/easytier.version"
+  return 0
+}
+
+update_node_full() {
+  require_root
+  require_linux
+  local rc=0
+  info "Starting node update..."
+  # Without systemd-run the updater shares the web unit's cgroup, and the
+  # delayed web restart at the end of update_app_safe would cut the core update short.
+  if inside_web_service; then
+    # Report progress before the core download, which can take a while on slow links;
+    # otherwise the panel sees a job that is still "queued" and gives up on it.
+    UPDATE_BRANCH="$(get_active_branch)" UPDATE_FROM="$(installed_version)" update_status running download
+    update_easytier_core_safe || true
+    update_app_safe || rc=$?
+    return "$rc"
+  fi
+  update_app_safe || rc=$?
+  (( rc == 0 )) || return "$rc"
+  update_easytier_core_safe || true
+  ok "Node update finished."
+}
+
+install_web_runtime() {
+  install_dependencies
+  update_web_assets
+
+  local active_b; active_b="$(get_active_branch)"
+  if [[ ! -f "$WEB_CONFIG_FILE" ]]; then
+    umask 077
+    cat > "$WEB_CONFIG_FILE" <<EOF_WEB_CFG
+WEB_PORT="${DEFAULT_WEB_PORT}"
+WEB_BIND="0.0.0.0"
+WEB_PASSWORD_HASH=""
+SUTUN_BRANCH="${active_b}"
+EOF_WEB_CFG
+    chmod 600 "$WEB_CONFIG_FILE"
+  else
+    if grep -q '^SUTUN_BRANCH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+      sed -i "s|^SUTUN_BRANCH=.*|SUTUN_BRANCH=\"${active_b}\"|" "$WEB_CONFIG_FILE"
+    else
+      echo "SUTUN_BRANCH=\"${active_b}\"" >> "$WEB_CONFIG_FILE"
+    fi
+  fi
+
+  write_web_services
+}
+
+write_web_services() {
+  cat > "$WEB_SERVICE_FILE" <<EOF_WEB_SVC
+[Unit]
+Description=SuTun Web UI & API Daemon
+Documentation=https://github.com/mdjes/SuTun
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-${WEB_CONFIG_FILE}
+ExecStart=/usr/bin/python3 ${WEB_DIR}/server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+ProtectHome=read-only
+SyslogIdentifier=sutun-web
+
+[Install]
+WantedBy=multi-user.target
+EOF_WEB_SVC
+
+  write_iperf_service
+  systemctl daemon-reload
+}
+
+get_web_port() {
+  local port=""
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    port="$(awk -F= '/^WEB_PORT=/ {gsub(/[" '\''\r\n]/, "", $2); print $2}' "$WEB_CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  echo "${port:-$DEFAULT_WEB_PORT}"
+  return 0
+}
+
+get_web_domain() {
+  local domain=""
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    domain="$(awk -F= '/^WEB_DOMAIN=/ {gsub(/[" '\''\r\n]/, "", $2); print $2}' "$WEB_CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  echo "${domain:-}"
+  return 0
+}
+
+get_web_proto() {
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    if grep -q '^WEB_SSL_CERT=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+      echo "https"
+      return 0
+    fi
+  fi
+  echo "http"
+  return 0
+}
+
+is_public_ipv4() {
+  local ip="$1" a b c d
+  valid_ipv4_address "$ip" || return 1
+  IFS='.' read -r a b c d <<< "$ip"
+  a=$((10#$a))
+  b=$((10#$b))
+  if (( a == 0 || a == 10 || a == 127 )); then return 1; fi
+  if (( a == 172 && b >= 16 && b <= 31 )); then return 1; fi
+  if (( a == 192 && b == 168 )); then return 1; fi
+  if (( a == 169 && b == 254 )); then return 1; fi
+  if (( a == 100 && b >= 64 && b <= 127 )); then return 1; fi
+  return 0
+}
+
+get_server_ip() {
+  # 1. Check if explicitly configured in web.env or config.env
+  local configured_ip=""
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    configured_ip="$(awk -F= '/^WEB_PUBLIC_IP=/ {gsub(/[" '\''\r\n]/, "", $2); print $2}' "$WEB_CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "$configured_ip" && -f "$CONFIG_FILE" ]]; then
+    configured_ip="$(awk -F= '/^PUBLIC_IP=/ {gsub(/[" '\''\r\n]/, "", $2); print $2}' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if is_public_ipv4 "$configured_ip"; then
+    echo "$configured_ip"
+    return 0
+  fi
+
+  # 2. Check active SSH session (3rd token is the server IP the user connected to)
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    local ssh_srv_ip
+    ssh_srv_ip="$(awk '{print $3}' <<< "$SSH_CONNECTION" 2>/dev/null || true)"
+    if is_public_ipv4 "$ssh_srv_ip"; then
+      echo "$ssh_srv_ip"
+      return 0
+    fi
+  fi
+
+  # 3. Check physical network interfaces for a directly bound public IPv4 (e.g. eth0, ens3)
+  local iface_ip
+  while read -r iface_ip; do
+    if is_public_ipv4 "$iface_ip"; then
+      echo "$iface_ip"
+      return 0
+    fi
+  done < <(ip -o -4 addr show scope global 2>/dev/null | awk '$2 !~ /^(easytier|tun|tap|docker|br-|veth|wg|lo)/ {print $4}' | cut -d/ -f1)
+
+  # 4. Check kernel default route source IP
+  local route_ip
+  route_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | awk '{print $1; exit}')"
+  if is_public_ipv4 "$route_ip"; then
+    echo "$route_ip"
+    return 0
+  fi
+
+  # 5. Multi-provider public IP query (for cloud servers behind 1:1 NAT like AWS/GCP)
+  local providers=(
+    "https://api.ipify.org"
+    "https://icanhazip.com"
+    "https://ifconfig.me/ip"
+    "https://checkip.amazonaws.com"
+    "https://ipinfo.io/ip"
+  )
+  local candidate=""
+  for url in "${providers[@]}"; do
+    candidate="$(curl -fsS4 --connect-timeout 2 --max-time 3 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if is_public_ipv4 "$candidate"; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  # 6. Fallback if behind private NAT and curl failed
+  if valid_ipv4_address "$route_ip"; then
+    echo "$route_ip"
+    return 0
+  fi
+
+  echo "127.0.0.1"
+  return 0
+}
+
+is_port_80_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlpn 'sport = :80' 2>/dev/null | grep -q ':80 '
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -i :80 >/dev/null 2>&1
+  else
+    fuser 80/tcp >/dev/null 2>&1
+  fi
+}
+
+get_port_80_service() {
+  local svc=""
+  if command -v ss >/dev/null 2>&1; then
+    svc="$(ss -tlpn 'sport = :80' 2>/dev/null | grep -oP 'users:\(\("\K[^"]+' | head -n1 || true)"
+  fi
+  if [[ -z "$svc" ]] && command -v fuser >/dev/null 2>&1; then
+    local pid
+    pid="$(fuser 80/tcp 2>/dev/null | awk '{print $1}' || true)"
+    if [[ -n "$pid" ]]; then
+      svc="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    fi
+  fi
+  echo "${svc:-webserver}"
+}
+
+ensure_certbot() {
+  if ! command -v certbot >/dev/null 2>&1; then
+    info "Installing Certbot for free Let's Encrypt SSL certificate generation..."
+    if command -v apt-get >/dev/null 2>&1; then
+      if apt-get update -qq; then
+        apt-get install -y -qq certbot >/dev/null 2>&1 || true
+      fi
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y -q certbot >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y -q certbot >/dev/null 2>&1 || true
+    fi
+  fi
+  command -v certbot >/dev/null 2>&1
+}
+
+# The web server stopped to free port 80 for the Let's Encrypt check, until it is started again.
+SSL_PAUSED_SERVICE=""
+
+resume_ssl_paused_service() {
+  [[ -n "$SSL_PAUSED_SERVICE" ]] || return 0
+  systemctl start "$SSL_PAUSED_SERVICE" 2>/dev/null || true
+  SSL_PAUSED_SERVICE=""
+}
+
+configure_web_ssl() {
+  install_web_runtime
+  header
+  section "DOMAIN & FREE SSL (HTTPS)"
+  info "Gets a free Let's Encrypt certificate that renews itself in the background."
+  printf '\n'
+
+  local domain pub_ip
+  pub_ip="$(get_server_ip)"
+  ask domain "Domain pointed to this server (e.g. panel.example.com)"
+  domain="${domain//[[:space:]]/}"
+  if [[ -z "$domain" ]]; then
+    fail "No domain was entered; nothing was changed."
+    return 1
+  fi
+
+  info "Checking the DNS records of ${domain}..."
+  local resolved_ip=""
+  if command -v getent >/dev/null 2>&1; then
+    resolved_ip="$(getent ahosts "$domain" 2>/dev/null | awk '{print $1; exit}' || true)"
+  elif command -v dig >/dev/null 2>&1; then
+    resolved_ip="$(dig +short "$domain" 2>/dev/null | tail -n1 || true)"
+  fi
+
+  if [[ -n "$resolved_ip" && "$resolved_ip" != "$pub_ip" ]]; then
+    warn "${domain} points to ${resolved_ip}, but this server's public IP is ${pub_ip}."
+    ask_yes_no "Continue anyway?" no || return 1
+  fi
+
+  ensure_certbot || {
+    fail "Could not install certbot. Please install certbot manually."
+    return 1
+  }
+
+  if is_port_80_busy; then
+    local busy_service
+    busy_service="$(get_port_80_service)"
+    warn "Port 80 is in use by: ${busy_service}"
+    if ! ask_yes_no "Stop ${busy_service} for a few seconds to get the certificate? It starts again right after." yes; then
+      fail "Let's Encrypt needs port 80 for its check. SSL setup stopped."
+      return 1
+    fi
+    info "Pausing ${busy_service}..."
+    SSL_PAUSED_SERVICE="$busy_service"
+    # Ctrl+C during the request must not leave that web server stopped.
+    on_cancel resume_ssl_paused_service
+    systemctl stop "$busy_service" 2>/dev/null || true
+  fi
+
+  info "Requesting a certificate for ${domain} from Let's Encrypt..."
+  local issued=0
+  if certbot certonly --standalone -d "$domain" --non-interactive --agree-tos --register-unsafely-without-email; then
+    issued=1
+  fi
+  resume_ssl_paused_service
+
+  if (( issued )); then
+    ok "SSL certificate obtained."
+    local cert_file="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    local key_file="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+    if [[ ! -f "$cert_file" || ! -f "$key_file" ]]; then
+      fail "certbot finished, but ${cert_file} or ${key_file} is missing."
+      return 1
+    else
+      # Setup automatic renewal hook
+      mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+      cat > /etc/letsencrypt/renewal-hooks/deploy/sutun-web.sh <<'EOF_RENEW'
+#!/usr/bin/env bash
+systemctl restart sutun-web.service >/dev/null 2>&1 || true
+EOF_RENEW
+      chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/sutun-web.sh
+
+      # Update web.env
+      sed -i '/^WEB_DOMAIN=/d' "$WEB_CONFIG_FILE"
+      sed -i '/^WEB_SSL_CERT=/d' "$WEB_CONFIG_FILE"
+      sed -i '/^WEB_SSL_KEY=/d' "$WEB_CONFIG_FILE"
+      {
+        printf 'WEB_DOMAIN=%q\n' "$domain"
+        printf 'WEB_SSL_CERT=%q\n' "$cert_file"
+        printf 'WEB_SSL_KEY=%q\n' "$key_file"
+      } >> "$WEB_CONFIG_FILE"
+
+      systemctl restart sutun-web.service 2>/dev/null || true
+      ok "HTTPS is on: https://${domain}:$(get_web_port)"
+      return 0
+    fi
+  else
+    fail "Let's Encrypt did not issue a certificate. Check that ${domain} points to this server and port 80 is reachable."
+    return 1
+  fi
+}
+remove_web_ssl() {
+  install_web_runtime
+  header
+  section "REMOVE WEB SSL (REVERT TO HTTP)"
+  if [[ -f "$WEB_CONFIG_FILE" ]]; then
+    sed -i '/^WEB_DOMAIN=/d' "$WEB_CONFIG_FILE"
+    sed -i '/^WEB_SSL_CERT=/d' "$WEB_CONFIG_FILE"
+    sed -i '/^WEB_SSL_KEY=/d' "$WEB_CONFIG_FILE"
+  fi
+  systemctl restart sutun-web.service 2>/dev/null || true
+  ok "Web SSL removed. Dashboard reverted to HTTP."
+  pause
+}
+
+configure_web_ui_interactive() {
+  install_web_runtime
+  header
+  section "WEB DASHBOARD SETUP"
+  info "Tunnels, routing and cluster sync are all managed from the web dashboard."
+  printf '\n'
+
+  local current_port
+  current_port="$(get_web_port)"
+  local custom_port
+  ask custom_port "Web dashboard port" "$current_port"
+  [[ "$custom_port" == "$current_port" ]] && custom_port=""
+  if [[ -n "$custom_port" ]]; then
+    if valid_port "$custom_port"; then
+      if grep -q '^WEB_PORT=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+        sed -i "s|^WEB_PORT=.*|WEB_PORT=\"${custom_port}\"|" "$WEB_CONFIG_FILE"
+      else
+        printf 'WEB_PORT=%q\n' "$custom_port" >> "$WEB_CONFIG_FILE"
+      fi
+      ok "Web port set to ${custom_port}."
+    else
+      warn "Invalid port entered. Keeping default port ${current_port}."
+    fi
+  fi
+
+  printf '\n'
+  if ask_yes_no "Do you have a domain pointing to this server and want free SSL (HTTPS)?" no; then
+    configure_web_ssl || warn "SSL configuration skipped or failed. Web Dashboard will run over HTTP."
+  fi
+
+  printf '\n'
+  local admin_pw=""
+  if ask_yes_no "Set a fixed web admin password? (No = one-time login links only)" no; then
+    ask admin_pw "Web admin password (Enter generates one)"
+    if [[ -z "$admin_pw" ]]; then
+      admin_pw="$(openssl rand -base64 9 | tr -dc 'a-zA-Z0-9' | head -c 10)"
+    fi
+    local hash
+    hash="$(python3 -c "import secrets, hashlib, sys
+pw = sys.argv[1]
+salt = secrets.token_hex(16)
+h = hashlib.sha256((salt + pw).encode('utf-8')).hexdigest()
+print(f'sha256\${salt}\${h}')
+" "$admin_pw")"
+    if grep -q '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+      sed -i "s|^WEB_PASSWORD_HASH=.*|WEB_PASSWORD_HASH=\"${hash}\"|" "$WEB_CONFIG_FILE"
+    else
+      printf 'WEB_PASSWORD_HASH=%q\n' "$hash" >> "$WEB_CONFIG_FILE"
+    fi
+    ok "Admin password configured."
+  else
+    if grep -q '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+      sed -i '/^WEB_PASSWORD_HASH=/d' "$WEB_CONFIG_FILE"
+    fi
+    ok "Token-Only login enabled (Highest security — password brute-force immune)."
+  fi
+  chmod 600 "$WEB_CONFIG_FILE" 2>/dev/null || true
+
+  systemctl enable --now sutun-web.service >/dev/null 2>&1 || true
+  systemctl enable --now sutun-iperf.service >/dev/null 2>&1 || true
+
+  # Automatically permit Web & Mesh ports if UFW firewall is active
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -qi "Status: active"; then
+      local ufw_wport
+      ufw_wport="$(get_web_port)"
+      ufw allow "${ufw_wport}/tcp" >/dev/null 2>&1 || true
+      local ufw_mport="11010"
+      if [[ -f "$CONFIG_FILE" ]]; then
+        ufw_mport="$(grep '^PORT=' "$CONFIG_FILE" 2>/dev/null | cut -d= -f2 | tr -d '\"'\'' ')"
+        ufw_mport="${ufw_mport:-11010}"
+      fi
+      ufw allow "${ufw_mport}/tcp" >/dev/null 2>&1 || true
+      ufw allow "${ufw_mport}/udp" >/dev/null 2>&1 || true
+      ok "Firewall (UFW): Allowed Web (${ufw_wport}/tcp) and Mesh (${ufw_mport}/tcp+udp) ports."
+    fi
+  fi
+
+  # Generate 1-hour access link
+  local token now expiry_ts pub_ip port proto domain web_url
+  token="$(openssl rand -hex 16)"
+  now="$(date +%s)"
+  expiry_ts=$(( now + 3600 ))
+  port="$(get_web_port)"
+  pub_ip="$(get_server_ip)"
+  proto="$(get_web_proto)"
+  domain="$(get_web_domain)"
+
+  python3 -c "import json, os, sys
+p = sys.argv[1]
+tk = sys.argv[2]
+exp = int(sys.argv[3])
+tokens = {}
+if os.path.isfile(p):
+    try:
+        with open(p, 'r') as f: tokens = json.load(f)
+    except Exception: pass
+tokens[tk] = {'expires': exp, 'one_time': True}
+with open(p, 'w') as f: json.dump(tokens, f, indent=2)
+try: os.chmod(p, 0o600)
+except Exception: pass
+" "$WEB_TOKEN_FILE" "$token" "$expiry_ts"
+
+  if [[ "$proto" == "https" && -n "$domain" ]]; then
+    web_url="https://${domain}:${port}"
+  else
+    web_url="http://${pub_ip}:${port}"
+  fi
+
+  printf '\n'
+  say "  ╭─ SETUP COMPLETE · SuTun v${VERSION} ─────────────────────────" "$GREEN"
+  ui_kv "Dashboard" "$web_url" "$BOLD$CYAN"
+  if [[ -n "$admin_pw" ]]; then
+    ui_kv "Admin password" "$admin_pw" "$BOLD$YELLOW"
+  else
+    ui_kv "Sign-in" "One-time login links only (no password to guess)" "$GREEN"
+  fi
+  say "  ├─ One-click login link (valid for 60 minutes) ───────────────" "$DIM$BLUE"
+  printf '\n  %b%s/?token=%s%b\n\n' "$BOLD$GREEN" "$web_url" "$token" "$RESET"
+  say "  ├─ Quick guide ───────────────────────────────────────────────" "$DIM$BLUE"
+  printf '  %b│%b  New login link any time: %bsudo sutun token%b\n' "$DIM$BLUE" "$RESET" "$BOLD$CYAN" "$RESET"
+  printf '  %b│%b  Tunnels, SafeSync and cluster updates live in the web dashboard.\n' "$DIM$BLUE" "$RESET"
+  printf '  %b│%b  Run %bsutun%b at any time to open this menu.\n' "$DIM$BLUE" "$RESET" "$BOLD$CYAN" "$RESET"
+  say "  ╰─────────────────────────────────────────────────────────────" "$DIM$BLUE"
+  printf '\n'
+
+  say "  What next?" "$BOLD"
+  local post_choice=0
+  ui_choose post_choice 0 \
+    "Open the SuTun menu" \
+    "Join an existing mesh with an invite code" \
+    "Exit to the terminal" || post_choice=2
+  if (( post_choice == 1 )); then
+    join_mesh_invite
+    return 0
+  elif (( post_choice == 2 )); then
+    printf '\n%b  ✓ Installation finished. Run %bsutun%b%b at any time to open the menu.%b\n\n' "$GREEN" "$BOLD$CYAN" "$RESET" "$GREEN" "$RESET"
+    return 1
+  fi
+  return 0
+}
+generate_web_token() {
+  install_web_runtime
+  local token now expiry_ts pub_ip port mesh_ip proto domain
+  token="$(openssl rand -hex 16)"
+  now="$(date +%s)"
+  expiry_ts=$(( now + 3600 ))
+  port="$(get_web_port)"
+  pub_ip="$(get_server_ip)"
+  proto="$(get_web_proto)"
+  domain="$(get_web_domain)"
+  mesh_ip=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    mesh_ip="$( (grep -E '^IPV4=' "$CONFIG_FILE" 2>/dev/null || true) | cut -d= -f2- | tr -d '"'\'' ' )"
+  fi
+
+  python3 -c "import json, os, sys
+p = sys.argv[1]
+tk = sys.argv[2]
+exp = int(sys.argv[3])
+tokens = {}
+if os.path.isfile(p):
+    try:
+        with open(p, 'r') as f: tokens = json.load(f)
+    except Exception: pass
+tokens[tk] = {'expires': exp, 'one_time': True}
+with open(p, 'w') as f: json.dump(tokens, f, indent=2)
+try: os.chmod(p, 0o600)
+except Exception: pass
+" "$WEB_TOKEN_FILE" "$token" "$expiry_ts"
+
+  if ! systemctl is-active --quiet sutun-web.service 2>/dev/null; then
+    systemctl enable --now sutun-web.service >/dev/null 2>&1 || true
+    systemctl enable --now sutun-iperf.service >/dev/null 2>&1 || true
+  fi
+
+  local link
+  if [[ "$proto" == "https" && -n "$domain" ]]; then
+    link="https://${domain}:${port}/?token=${token}"
+  else
+    link="http://${pub_ip}:${port}/?token=${token}"
+  fi
+
+  header
+  section "ONE-CLICK WEB DASHBOARD LOGIN"
+  ok "A one-time login link was created. It works once, within the next 60 minutes."
+  printf '\n'
+  # Each link sits on its own line, without box characters, so it copies cleanly.
+  say "  ╭─ Open this link in your browser ────────────────────────────" "$DIM$BLUE"
+  printf '\n  %b%s%b\n\n' "$BOLD$GREEN" "$link" "$RESET"
+  if [[ -n "$mesh_ip" ]]; then
+    say "  ├─ From inside the mesh (virtual IP) ─────────────────────────" "$DIM$BLUE"
+    printf '\n  %b%s%b\n\n' "$BLUE" "http://${mesh_ip}:${port}/?token=${token}" "$RESET"
+  fi
+  say "  ├─ Token only ────────────────────────────────────────────────" "$DIM$BLUE"
+  printf '\n  %b%s%b\n\n' "$BOLD$YELLOW" "$token" "$RESET"
+  say "  ╰─────────────────────────────────────────────────────────────" "$DIM$BLUE"
+  pause
+}
+
+set_web_password() {
+  install_web_runtime
+  header
+  section "ADMIN PASSWORD & AUTHENTICATION"
+
+  local current_hash=""
+  if grep -q '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+    current_hash="$(grep -E '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" | cut -d= -f2- | tr -d '"'\'' ')"
+  fi
+
+  local pw_choice=0
+  if [[ -n "$current_hash" ]]; then
+    printf '  Sign-in now: %bfixed password + one-time login links%b\n\n' "$GREEN" "$RESET"
+    ui_choose pw_choice 0 \
+      "Change the admin password" \
+      "Remove the password (one-time login links only, nothing to brute-force)" \
+      "Back" || return 0
+    if (( pw_choice == 2 )); then
+      return 0
+    elif (( pw_choice == 1 )); then
+      sed -i '/^WEB_PASSWORD_HASH=/d' "$WEB_CONFIG_FILE"
+      systemctl restart sutun-web.service 2>/dev/null || true
+      ok "Password removed. The web panel now accepts one-time login links only."
+      pause
+      return 0
+    fi
+  else
+    printf '  Sign-in now: %bone-time login links only (no password)%b\n\n' "$YELLOW" "$RESET"
+    ui_choose pw_choice 0 \
+      "Set an admin password" \
+      "Back (keep login links only)" || return 0
+    if (( pw_choice == 1 )); then
+      return 0
+    fi
+  fi
+
+  printf '\n'
+  local pass1 pass2 hash
+  ask_secret pass1 "New admin password"
+  ask_secret pass2 "Repeat the password"
+  if [[ "$pass1" != "$pass2" ]]; then
+    fail "Passwords do not match."
+    pause
+    return 1
+  fi
+  if [[ ${#pass1} -lt 6 ]]; then
+    fail "Password must be at least 6 characters long."
+    pause
+    return 1
+  fi
+
+  hash="$(python3 -c "import secrets, hashlib, sys
+pw = sys.argv[1]
+salt = secrets.token_hex(16)
+h = hashlib.sha256((salt + pw).encode('utf-8')).hexdigest()
+print(f'sha256\${salt}\${h}')
+" "$pass1")"
+
+  if grep -q '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+    sed -i "s|^WEB_PASSWORD_HASH=.*|WEB_PASSWORD_HASH=\"${hash}\"|" "$WEB_CONFIG_FILE"
+  else
+    printf 'WEB_PASSWORD_HASH=%q\n' "$hash" >> "$WEB_CONFIG_FILE"
+  fi
+  chmod 600 "$WEB_CONFIG_FILE"
+
+  systemctl restart sutun-web.service 2>/dev/null || true
+  ok "Admin password configured successfully."
+  pause
+}
+
+configure_web_port() {
+  install_web_runtime
+  header
+  section "CHANGE WEB PORT"
+  local current_port new_port
+  current_port="$(get_web_port)"
+  ask new_port "Web panel port" "$current_port"
+  if ! valid_port "$new_port"; then
+    fail "Invalid port number."
+    pause
+    return 1
+  fi
+
+  if grep -q '^WEB_PORT=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+    sed -i "s|^WEB_PORT=.*|WEB_PORT=\"${new_port}\"|" "$WEB_CONFIG_FILE"
+  else
+    printf 'WEB_PORT=%q\n' "$new_port" >> "$WEB_CONFIG_FILE"
+  fi
+
+  systemctl restart sutun-web.service 2>/dev/null || true
+  ok "Web port updated to ${new_port}."
+  pause
+}
+
+update_core() {
+  require_root
+  local rc=0 before_app before_core after_core
+  before_app="$(installed_version)"
+  before_core="$(cat "${INSTALL_DIR}/easytier.version" 2>/dev/null || echo "not installed")"
+  header
+  section "UPDATE SUTUN"
+  ui_kv "SuTun" "$before_app"
+  ui_kv "EasyTier" "$before_core"
+  printf '\n'
+
+  if [[ ! -x "${BIN_DIR}/easytier-core" ]]; then
+    install_core || rc=1
+  fi
+  if (( rc == 0 )); then
+    if [[ -d "$WEB_DIR" || -f "$WEB_SERVICE_FILE" ]]; then
+      # Verified download, backup, health check and rollback; EasyTier only moves to a newer release.
+      update_node_full || rc=$?
+    else
+      update_easytier_core_safe || rc=$?
+    fi
+  fi
+
+  after_core="$(cat "${INSTALL_DIR}/easytier.version" 2>/dev/null || echo "not installed")"
+  printf '\n'
+  if (( rc == 0 )); then
+    ok "SuTun ${before_app} → $(installed_version)   ·   EasyTier ${before_core} → ${after_core}"
+  elif (( rc == 3 )); then
+    warn "Another update is already running on this server; try again when it finishes."
+  else
+    fail "The update did not complete; see the messages above."
+  fi
+  if [[ -t 0 ]]; then
+    pause
+  fi
+  return "$rc"
+}
+
+uninstall_app() {
+  header
+  section "UNINSTALL SUTUN"
+  warn "This removes every SuTun service, tunnel, configuration file and binary."
+  warn "This server leaves the mesh, and the web panel stops working."
+  printf '\n'
+  local confirm
+  ask confirm "Type REMOVE to confirm"
+  [[ "$confirm" == "REMOVE" ]] || { info "Uninstall cancelled. Nothing was changed."; return 0; }
+  trap '' INT
+  systemctl disable --now sutun.service 2>/dev/null || true
+  systemctl disable --now sutun-haproxy.service 2>/dev/null || true
+  systemctl disable --now sutun-iptables.service 2>/dev/null || true
+  systemctl disable --now sutun-gost.service 2>/dev/null || true
+  systemctl disable --now sutun-realm.service 2>/dev/null || true
+  systemctl disable --now sutun-web.service 2>/dev/null || true
+  systemctl disable --now sutun-iperf.service 2>/dev/null || true
+  if [[ -x "$IPTABLES_APPLY_SCRIPT" ]]; then
+    "$IPTABLES_APPLY_SCRIPT" remove >/dev/null 2>&1 || true
+  fi
+  remove_all_icmp_links
+  rm -f "$SERVICE_FILE" "$HAPROXY_SERVICE_FILE" "$IPTABLES_SERVICE_FILE" "$IPTABLES_SYSCTL_FILE" "$GOST_SERVICE_FILE" "$GOST_CONFIG_FILE" "$REALM_SERVICE_FILE" "$REALM_CONFIG_FILE" "$WEB_SERVICE_FILE" "$IPERF_SERVICE_FILE" /usr/local/bin/sutun
+  rm -rf -- "$INSTALL_DIR" /etc/sutun
+  systemctl daemon-reload
+  ok "SuTun has been removed."
+  exit 0
+}
+
+self_test_platform() {
+  [[ "$(uname -s)" == "Linux" ]] && command -v systemctl >/dev/null
+}
+
+self_test_commands() {
+  local command_name
+  for command_name in curl unzip openssl ip ping jq sha256sum ss python3 iperf3; do
+    command -v "$command_name" >/dev/null || return 1
+  done
+}
+
+self_test_core() {
+  [[ -x "${BIN_DIR}/easytier-core" && -x "${BIN_DIR}/easytier-cli" ]]
+}
+
+self_test_config_permissions() {
+  [[ "$(stat -c '%a' "$CONFIG_FILE")" == "600" ]]
+}
+
+self_test_iptables_command() {
+  command -v iptables >/dev/null 2>&1
+}
+
+self_test_ipv4_forwarding() {
+  [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" == "1" ]]
+}
+
+self_test() {
+  local failures=0 checks=0
+  header
+  section "SUTUN SELF-TEST"
+
+  test_result() {
+    ((checks+=1))
+    if "$@"; then
+      ok "$SELF_TEST_LABEL"
+    else
+      fail "$SELF_TEST_LABEL"
+      ((failures+=1))
+    fi
+  }
+
+  SELF_TEST_LABEL="Linux and systemd are available"
+  test_result self_test_platform
+  SELF_TEST_LABEL="Required commands are installed"
+  test_result self_test_commands
+  SELF_TEST_LABEL="EasyTier core and CLI are executable"
+  test_result self_test_core
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    SELF_TEST_LABEL="Node configuration has secure permissions"
+    test_result self_test_config_permissions
+    SELF_TEST_LABEL="Node systemd unit is valid"
+    test_result systemd-analyze verify "$SERVICE_FILE"
+    SELF_TEST_LABEL="Mesh service is active"
+    test_result systemctl is-active --quiet sutun.service
+  else
+    warn "Node configuration checks skipped: no node is configured."
+  fi
+
+  if compgen -G "${HAPROXY_TUNNEL_DIR}/*.env" >/dev/null; then
+    SELF_TEST_LABEL="HAProxy configuration is valid"
+    test_result haproxy -c -f "$HAPROXY_CONFIG"
+    SELF_TEST_LABEL="HAProxy service is active"
+    test_result systemctl is-active --quiet sutun-haproxy.service
+  fi
+  if compgen -G "${IPTABLES_TUNNEL_DIR}/*.env" >/dev/null; then
+    SELF_TEST_LABEL="iptables command is available"
+    test_result self_test_iptables_command
+    SELF_TEST_LABEL="IPv4 forwarding is enabled"
+    test_result self_test_ipv4_forwarding
+    SELF_TEST_LABEL="iptables tunnel service is active"
+    test_result systemctl is-active --quiet sutun-iptables.service
+    SELF_TEST_LABEL="SuTun DNAT chain is active"
+    test_result iptables -w -t nat -S SUTUN_DNAT
+  fi
+  if compgen -G "${GOST_TUNNEL_DIR}/*.env" >/dev/null; then
+    SELF_TEST_LABEL="GOST binary is installed"
+    test_result test -x "$GOST_BIN"
+    SELF_TEST_LABEL="GOST service is active"
+    test_result systemctl is-active --quiet sutun-gost.service
+  fi
+  if compgen -G "${REALM_TUNNEL_DIR}/*.env" >/dev/null; then
+    SELF_TEST_LABEL="Realm binary is installed"
+    test_result test -x "$REALM_BIN"
+    SELF_TEST_LABEL="Realm service is active"
+    test_result systemctl is-active --quiet sutun-realm.service
+  fi
+  if [[ -f "$WEB_SERVICE_FILE" ]]; then
+    SELF_TEST_LABEL="Web Dashboard service is active"
+    test_result systemctl is-active --quiet sutun-web.service
+    SELF_TEST_LABEL="iperf3 speedtest service is active"
+    test_result systemctl is-active --quiet sutun-iperf.service
+  fi
+
+  printf '\n'
+  if (( failures == 0 )); then
+    ok "All ${checks} checks passed."
+  else
+    fail "${failures} of ${checks} checks failed."
+  fi
+  [[ -t 0 ]] && pause
+  (( failures == 0 ))
+}
+
+bootstrap_web_first() {
+  require_root
+  require_linux
+  set +e
+  set +u
+  set +o pipefail
+  trap - ERR
+
+  header
+  if [[ -t 1 ]]; then
+    printf '\n'
+    ui_logo
+  fi
+  section "FIRST-TIME SETUP"
+  info "Installing system packages, the EasyTier core and the web dashboard."
+  info "Press Ctrl+C at any time to stop; run the installer again to continue."
+  printf '\n'
+
+
+  install_dependencies
+  install_core
+  ensure_sutun_cli >/dev/null 2>&1 || true
+
+  if configure_web_ui_interactive; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Services
+# ---------------------------------------------------------------------------
+
+# Tunnel units set up on this server; they start and stop with everything else.
+enabled_tunnel_units() {
+  local unit
+  for unit in sutun-haproxy.service sutun-iptables.service sutun-gost.service sutun-realm.service; do
+    systemctl is-enabled --quiet "$unit" 2>/dev/null && printf '%s\n' "$unit"
+  done
+  return 0
+}
+
+stop_all_services() {
+  systemctl stop sutun.service sutun-web.service sutun-haproxy.service sutun-iptables.service \
+    sutun-gost.service sutun-realm.service sutun-iperf.service 2>/dev/null || true
+  systemctl stop 'sutun-icmp@*' 2>/dev/null || true
+}
+
+# start_all_services <start|restart>: the mesh node (with its links), the web
+# panel, the speedtest server and every enabled tunnel. Returns 1 if one failed.
+start_all_services() {
+  local verb="$1" unit rc=0
+  if [[ -f "$CONFIG_FILE" ]]; then
+    apply_node_config || rc=1
+  fi
+  if [[ -f "$WEB_SERVICE_FILE" ]]; then
+    systemctl "$verb" sutun-web.service 2>/dev/null || rc=1
+  fi
+  if [[ -f "$IPERF_SERVICE_FILE" ]]; then
+    systemctl "$verb" sutun-iperf.service 2>/dev/null || true
+  fi
+  while IFS= read -r unit; do
+    systemctl "$verb" "$unit" 2>/dev/null || rc=1
+  done < <(enabled_tunnel_units)
+  return "$rc"
+}
+
+# ui_state_row <systemd state> <label> [detail]: a coloured status row.
+ui_state_row() {
+  local dot word colour
+  case "$1" in
+    active) dot="●"; word="online"; colour="$GREEN" ;;
+    activating|reloading) dot="◐"; word="starting"; colour="$YELLOW" ;;
+    failed) dot="●"; word="failed"; colour="$RED" ;;
+    *) dot="○"; word="offline"; colour="$RED" ;;
+  esac
+  printf '  %b%s%b %-12s %b%-9s%b %s\n' "$colour" "$dot" "$RESET" "$2" "$colour" "$word" "$RESET" "${3:-}"
+}
+
+service_status_table() {
+  local entry unit label state
+  local -a units=("sutun.service|Mesh node" "sutun-web.service|Web panel" "sutun-iperf.service|Speedtest")
+  for entry in "haproxy|HAProxy" "iptables|iptables" "gost|GOST" "realm|Realm"; do
+    [[ -f "/etc/systemd/system/sutun-${entry%%|*}.service" ]] && units+=("sutun-${entry%%|*}.service|${entry#*|} tunnels")
+  done
+  section "SERVICE STATUS"
+  for entry in "${units[@]}"; do
+    unit="${entry%%|*}"
+    label="${entry#*|}"
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    ui_state_row "${state:-inactive}" "$label"
+  done
+}
+
+# services_screen <start|restart|stop>
+services_screen() {
+  local action="$1"
+  header
+  case "$action" in
+    stop)
+      section "STOP ALL SERVICES"
+      warn "The mesh node, web panel, speedtest server and tunnels will stop."
+      warn "The web panel stays unreachable until the services are started again."
+      printf '\n'
+      if ! ask_yes_no "Stop all SuTun services?" no; then
+        info "Nothing was stopped."
+        return 0
+      fi
+      info "Stopping services..."
+      stop_all_services
+      ;;
+    start|restart)
+      section "${action^^} ALL SERVICES"
+      if [[ ! -f "$CONFIG_FILE" ]]; then
+        info "No mesh node is set up yet; starting the web panel and tunnels only."
+      fi
+      info "${action^}ing services. Ctrl+C is paused until this finishes."
+      trap '' INT
+      start_all_services "$action" || warn "Some services did not start; see the table below."
+      trap 'handle_interrupt' INT
+      ;;
+  esac
+  service_status_table
+}
+
+logs_screen() {
+  header
+  section "LIVE LOGS"
+  local pick=0
+  ui_choose pick 0 \
+    "Mesh node" \
+    "Web panel" \
+    "Tunnels (HAProxy, GOST, Realm, iptables)" \
+    "ICMP / PCK links" || return 0
+  printf '\n'
+  info "Following the logs. Press Ctrl+C to return to the menu."
+  printf '\n'
+  CANCEL_NOTE="Stopped following the logs."
+  case "$pick" in
+    0) journalctl -u sutun.service -f -n 50 ;;
+    1) journalctl -u sutun-web.service -f -n 50 ;;
+    2) journalctl -u sutun-haproxy.service -u sutun-gost.service -u sutun-realm.service -u sutun-iptables.service -f -n 50 ;;
+    3) journalctl -u 'sutun-icmp@*' -f -n 50 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Tunnels without the web panel: an overview, re-apply and an emergency stop,
+# for when the panel is unreachable (for example a tunnel took the panel's port).
+# ---------------------------------------------------------------------------
+
+TUNNELS_SAVED=0     # saved tunnel definitions, counted by the last tunnels_overview
+
+# tunnel_fields <kind> <definition>: print "name<TAB>target<TAB>protocol<TAB>ports".
+tunnel_fields() {
+  (
+    unset TUNNEL_NAME TARGET_IP PORT_SPEC PROTOCOL FORWARD_PROTOCOL
+    # shellcheck disable=SC1090
+    source "$2" 2>/dev/null
+    case "$1" in
+      haproxy) proto="tcp" ;;
+      iptables) proto="${FORWARD_PROTOCOL:-udp}" ;;
+      *) proto="${PROTOCOL:-both}" ;;
+    esac
+    printf '%s\t%s\t%s\t%s\n' "${TUNNEL_NAME:-$(basename "$2" .env)}" "${TARGET_IP:-?}" "${proto,,}" "${PORT_SPEC:-?}"
+  )
+}
+
+# tunnels_overview: every saved tunnel under its service's state, with a warning for
+# any tunnel that listens on the web panel's TCP port.
+tunnels_overview() {
+  local entry kind label dir unit state def name target proto ports shown room web_port
+  local -a clashes=()
+  TUNNELS_SAVED=0
+  web_port="$(get_web_port)"
+  ui_term_size
+  room=$(( $(ui_width) - 43 ))
+  (( room < 8 )) && room=8
+
+  section "TUNNELS"
+  for entry in "${TUNNEL_KINDS[@]}"; do
+    IFS='|' read -r kind label dir unit <<< "$entry"
+    compgen -G "${dir}/*.env" >/dev/null || continue
+    state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    printf '\n'
+    ui_state_row "${state:-inactive}" "$label"
+    for def in "$dir"/*.env; do
+      [[ -f "$def" ]] || continue
+      IFS=$'\t' read -r name target proto ports < <(tunnel_fields "$kind" "$def")
+      TUNNELS_SAVED=$(( TUNNELS_SAVED + 1 ))
+      shown="$ports"
+      (( ${#shown} > room )) && shown="${shown:0:room-1}…"
+      printf '    %-16s %-15s %-5s %s\n' "$name" "$target" "$proto" "$shown"
+      if [[ "$proto" != "udp" ]] && expand_port_spec "$ports" 2>/dev/null | grep -qx "$web_port"; then
+        clashes+=("${label} tunnel '${name}'")
+      fi
+    done
+  done
+  if (( TUNNELS_SAVED == 0 )); then
+    info "No port-forwarding tunnels are saved on this server."
+    info "Create them in the web panel, under Tunnels."
+  fi
+
+  if compgen -G "${ICMP_LINK_DIR}/*.env" >/dev/null; then
+    section "ICMP / PCK LINKS"
+    list_icmp_links
+  fi
+
+  if (( ${#clashes[@]} )); then
+    printf '\n'
+    for entry in "${clashes[@]}"; do
+      warn "${entry} listens on TCP port ${web_port}, the web panel's port."
+    done
+    warn "Stop all tunnels, or move the panel to another port, to reach the panel again."
+  fi
+  return 0
+}
+
+# reapply_tunnels [warning prefix]: rebuild and start every kind of tunnel that has saved definitions.
+reapply_tunnels() {
+  local entry kind label dir unit rc=0
+  for entry in "${TUNNEL_KINDS[@]}"; do
+    IFS='|' read -r kind label dir unit <<< "$entry"
+    compgen -G "${dir}/*.env" >/dev/null || continue
+    info "Re-enabling the saved ${label} tunnels."
+    "apply_${kind}_config" || { warn "${1:-}${label} tunnels need attention."; rc=1; }
+  done
+  return "$rc"
+}
+
+# stop_all_tunnels: stop every port-forwarding tunnel and keep it off after a reboot.
+# The saved definitions stay, so reapply_tunnels brings them back.
+stop_all_tunnels() {
+  local entry kind label dir unit stopped=0
+  for entry in "${TUNNEL_KINDS[@]}"; do
+    IFS='|' read -r kind label dir unit <<< "$entry"
+    if [[ "$kind" == "iptables" ]]; then
+      # The rules live in the kernel, not in a process, so they are removed too.
+      [[ -f "/etc/systemd/system/${unit}" || -x "$IPTABLES_APPLY_SCRIPT" ]] || continue
+      disable_iptables_tunnels
+    else
+      [[ -f "/etc/systemd/system/${unit}" ]] || continue
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+    fi
+    ok "${label} tunnels stopped."
+    stopped=1
+  done
+  (( stopped )) || info "No tunnel services are set up on this server."
+  return 0
+}
+
+tunnels_screen() {
+  header
+  tunnels_overview
+  (( TUNNELS_SAVED )) || return 0
+  printf '\n'
+  local pick=0
+  ui_choose pick 0 "Back to the menu" "Re-apply saved tunnels" || pick=0
+  if (( pick == 0 )); then
+    UI_PAUSED=1
+    return 0
+  fi
+  printf '\n'
+  info "Applying the saved tunnels. Ctrl+C is paused until this finishes."
+  trap '' INT
+  if reapply_tunnels; then
+    ok "The saved tunnels are running."
+  fi
+  trap 'handle_interrupt' INT
+  service_status_table
+}
+
+stop_tunnels_screen() {
+  header
+  section "STOP ALL TUNNELS"
+  warn "Every HAProxy, iptables, GOST and Realm tunnel stops, and stays off after a reboot."
+  info "The saved tunnels are kept. 'Tunnels overview' can start them again."
+  info "ICMP/PCK links carry the mesh itself and keep running."
+  printf '\n'
+  if ! ask_yes_no "Stop all tunnels?" no; then
+    info "Nothing was stopped."
+    return 0
+  fi
+  trap '' INT
+  stop_all_tunnels
+  trap 'handle_interrupt' INT
+  service_status_table
+}
+
+# ---------------------------------------------------------------------------
+# Main menu
+# Arrow keys (or j/k) move, Enter opens, digits jump to an item, q quits.
+# ---------------------------------------------------------------------------
+
+# One row per line: "id|number|label|hint", "#Section", or "" for a gap.
+# Labels and hints are plain ASCII, so their length is their width on screen.
+MENU_ROWS=(
+  "#WEB PANEL"
+  "login|1|Login link & panel address|A one-time login link for the web panel, valid for 60 minutes."
+  "password|2|Admin password & sign-in|Set, change or remove the fixed admin password."
+  "port|3|Change panel port|Move the web panel to another TCP port."
+  "ssl|4|Domain & free SSL (HTTPS)|A free Let's Encrypt certificate for your own domain."
+  "nossl|5|Remove SSL|Serve the panel over plain HTTP again."
+  ""
+  "#MESH NETWORK"
+  "join|6|Join a mesh with an invite code|Paste an xrmesh:// code from a server that is already in the mesh."
+  "setup|7|Configure this node|Wizard for the network name, secret, virtual IP, protocol and ports."
+  "invite|8|Invite code for another server|The code another server pastes to join this mesh."
+  "live|9|Live status & peers|Connected servers, latency and traffic, refreshed every second."
+  "diag|10|Connection diagnostics|Listeners, the peer center and recent connection messages."
+  ""
+  "#SERVICES"
+  "restart|11|Restart all services|Restart the mesh node, web panel, speedtest server and tunnels."
+  "start|12|Start all services|Start everything that is set up on this server."
+  "stop|13|Stop all services|Stop the mesh, the web panel and the tunnels. Asks first."
+  "logs|14|Live logs|Follow the mesh, panel, tunnel or link logs. Ctrl+C comes back here."
+  ""
+  "#TUNNELS"
+  "tunnels|15|Tunnels overview|Saved tunnels, their ports and state. Can start them again."
+  "tunoff|16|Stop all tunnels|Emergency stop, e.g. a tunnel took the panel's port. Asks first."
+  ""
+  "#SYSTEM"
+  "doctor|17|Health check|Checks the binaries, config permissions and every service."
+  "update|18|Update SuTun|Verified download of the newest release, with automatic rollback."
+  "uninstall|19|Uninstall SuTun|Removes SuTun and everything it set up. Asks first."
+  "exit|0|Exit|Close the menu. Run 'sutun' to open it again."
+)
+# Items whose number is drawn in red.
+MENU_DANGER=" stop tunoff uninstall "
+
+MENU_SEL=1          # index in MENU_ROWS of the highlighted item
+MENU_TOP=0          # first list row on screen when the list scrolls
+MENU_CHOICE=""
+MENU_STATUS=""      # status lines, rebuilt each time the menu is shown
+MENU_PUBLIC_IP=""   # looked up once; the lookup can take seconds behind NAT
+MENU_RESIZED=0
+MENU_HEAD=()        # logo or title bar plus the status lines, for the current size
+
+menu_is_item() {
+  local row="${MENU_ROWS[$1]}"
+  [[ -n "$row" && "$row" != \#* ]]
+}
+
+# menu_move <-1|1>: move the highlight to the previous or next item, wrapping around.
+menu_move() {
+  local n=${#MENU_ROWS[@]} i=$MENU_SEL step
+  for (( step = 0; step < n; step++ )); do
+    i=$(( (i + $1 + n) % n ))
+    if menu_is_item "$i"; then
+      MENU_SEL=$i
+      return 0
+    fi
+  done
+}
+
+# menu_jump <number>: highlight the item with that number; returns 1 if there is none.
+menu_jump() {
+  local i row num
+  for i in "${!MENU_ROWS[@]}"; do
+    menu_is_item "$i" || continue
+    row="${MENU_ROWS[i]#*|}"
+    num="${row%%|*}"
+    if [[ "$num" == "$1" ]]; then
+      MENU_SEL=$i
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True when some item number starts with <digits> and is longer than it (1 → 10..17).
+menu_has_longer() {
+  local i row num
+  for i in "${!MENU_ROWS[@]}"; do
+    menu_is_item "$i" || continue
+    row="${MENU_ROWS[i]#*|}"
+    num="${row%%|*}"
+    [[ "$num" == "$1"?* ]] && return 0
+  done
+  return 1
+}
+
+menu_status_lines() {
+  local mesh_state web_state iperf_state port proto domain url tls auth node
+  mesh_state="$(systemctl is-active sutun.service 2>/dev/null || true)"
+  web_state="$(systemctl is-active sutun-web.service 2>/dev/null || true)"
+  iperf_state="$(systemctl is-active sutun-iperf.service 2>/dev/null || true)"
+  port="$(get_web_port 2>/dev/null || echo "$DEFAULT_WEB_PORT")"
+  proto="$(get_web_proto 2>/dev/null || echo "http")"
+  domain="$(get_web_domain 2>/dev/null || true)"
+  [[ -n "$MENU_PUBLIC_IP" ]] || MENU_PUBLIC_IP="$(get_server_ip 2>/dev/null || echo "127.0.0.1")"
+
+  if [[ "$proto" == "https" && -n "$domain" ]]; then
+    url="https://${domain}:${port}"
+    tls="HTTPS"
+  else
+    url="http://${MENU_PUBLIC_IP}:${port}"
+    tls="HTTP (no SSL)"
+  fi
+  if grep -q '^WEB_PASSWORD_HASH=' "$WEB_CONFIG_FILE" 2>/dev/null; then
+    auth="password + login links"
+  else
+    auth="login links only"
+  fi
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # A subshell, so the config's variables (HOSTNAME, PORT, ...) do not leak into the menu.
+    node="$(
+      # shellcheck disable=SC1090
+      source "$CONFIG_FILE" 2>/dev/null
+      printf '%s  %s  %s' "${HOSTNAME:-node}" "${IPV4:-?}" "${PROTOCOL:-dual}"
+    )"
+    ui_state_row "${mesh_state:-inactive}" "Mesh node" "$node"
+  else
+    printf '  %b○%b %-12s %b%-9s%b %s\n' "$GRAY" "$RESET" "Mesh node" "$YELLOW" "not set" "$RESET" \
+      "choose 6 to join a mesh or 7 to create one"
+  fi
+  ui_state_row "${web_state:-inactive}" "Web panel" "$url"
+  ui_state_row "${iperf_state:-inactive}" "Speedtest" "iperf3, port 5201 inside the mesh"
+  printf '  %b◆%b %-12s %s · %s\n' "$PURPLE" "$RESET" "Sign-in" "$auth" "$tls"
+}
+
+# Build the part above the list for the current terminal size: the large logo
+# when everything fits under it, the compact title bar otherwise.
+menu_prepare() {
+  local -a brand status
+  mapfile -t status <<< "$MENU_STATUS"
+  if (( UI_ROWS >= 7 + 1 + ${#status[@]} + 1 + ${#MENU_ROWS[@]} + 4 && UI_COLS >= 56 )); then
+    mapfile -t brand < <(ui_logo)
+  else
+    mapfile -t brand < <(ui_title_bar)
+  fi
+  MENU_HEAD=("${brand[@]}" "" "${status[@]}" "")
+}
+
+# menu_draw [typed digits]: draw the whole menu in one write, from the top-left corner.
+menu_draw() {
+  local digits="${1:-}" w n list_h cap top i row id num label hint title pad colour fill frame=""
+  local -a lines=()
+  w="$(ui_width)"
+  n=${#MENU_ROWS[@]}
+
+  lines=("${MENU_HEAD[@]}")
+
+  # The list gets the rows left over; it scrolls, with ▲/▼ markers, when that is too few.
+  list_h=$(( UI_ROWS - ${#MENU_HEAD[@]} - 4 ))
+  (( list_h < 5 )) && list_h=5
+  if (( n <= list_h )); then
+    top=0
+    cap=$n
+  else
+    cap=$(( list_h - 2 ))
+    top=$MENU_TOP
+    (( MENU_SEL < top )) && top=$MENU_SEL
+    (( MENU_SEL >= top + cap )) && top=$(( MENU_SEL - cap + 1 ))
+    # Keep a section title visible above its first item.
+    if (( top > 0 && top == MENU_SEL )) && [[ "${MENU_ROWS[top - 1]}" == \#* ]]; then
+      top=$(( top - 1 ))
+    fi
+    (( top > n - cap )) && top=$(( n - cap ))
+    (( top < 0 )) && top=0
+    MENU_TOP=$top
+    if (( top > 0 )); then
+      lines+=("  ${DIM}${GRAY}▲ more${RESET}")
+    else
+      lines+=("")
+    fi
+  fi
+
+  for (( i = top; i < top + cap && i < n; i++ )); do
+    row="${MENU_ROWS[i]}"
+    if [[ -z "$row" ]]; then
+      lines+=("")
+    elif [[ "$row" == \#* ]]; then
+      title="${row#\#}"
+      pad=$(( w - ${#title} - 1 ))
+      (( pad < 1 )) && pad=1
+      printf -v fill '%*s' "$pad" ''
+      lines+=("  ${BOLD}${PURPLE}${title}${RESET} ${DIM}${BLUE}${fill// /─}${RESET}")
+    else
+      IFS='|' read -r id num label hint <<< "$row"
+      colour="$CYAN"
+      [[ "$MENU_DANGER" == *" ${id} "* ]] && colour="$RED"
+      [[ "$id" == "exit" ]] && colour="$GRAY"
+      (( ${#num} < 2 )) && num=" ${num}"
+      if (( i == MENU_SEL )); then
+        # "  ❯ " then the highlight bar: " NN  label" padded to the box width.
+        pad=$(( w - 7 - ${#label} ))
+        (( pad < 1 )) && pad=1
+        printf -v fill '%*s' "$pad" ''
+        lines+=("  ${BOLD}${CYAN}❯${RESET} ${SEL_BG}${BOLD}${colour} ${num}${RESET}${SEL_BG}${BOLD}  ${label}${fill}${RESET}")
+      else
+        lines+=("     ${colour}${num}${RESET}  ${label}")
+      fi
+    fi
+  done
+
+  if (( n > list_h )); then
+    if (( top + cap < n )); then
+      lines+=("  ${DIM}${GRAY}▼ more${RESET}")
+    else
+      lines+=("")
+    fi
+  fi
+
+  IFS='|' read -r _ _ _ hint <<< "${MENU_ROWS[MENU_SEL]}"
+  printf -v fill '%*s' "$w" ''
+  lines+=("  ${DIM}${BLUE}${fill// /─}${RESET}")
+  lines+=("  ${CYAN}›${RESET} ${hint}")
+  if [[ -n "$digits" ]]; then
+    lines+=("  ${DIM}${GRAY}↑/↓ move · Enter open · q quit${RESET}   ${BOLD}${YELLOW}#${digits}${RESET}")
+  else
+    lines+=("  ${DIM}${GRAY}↑/↓ move · Enter open · 0-17 jump · q quit${RESET}")
+  fi
+
+  for row in "${lines[@]}"; do
+    frame+="${row}"$'\033[K\n'
+  done
+  printf '\033[H%s\033[J' "$frame"
+}
+
+# Let the user pick an item; its id goes to MENU_CHOICE.
+menu_select() {
+  local digits="" last_digit=0 now status
+
+  if ! ui_interactive; then
+    menu_select_plain
+    return
+  fi
+
+  ui_term_size
+  menu_prepare
+  # No cursor, no line wrap (each row stays one line), no echo of keys typed while drawing.
+  printf '\033[?25l\033[?7l\033[H\033[2J'
+  stty -echo 2>/dev/null || true
+  while :; do
+    menu_draw "$digits"
+    status=0
+    ui_read_key || status=$?
+    if (( status == 1 )); then
+      MENU_CHOICE="exit"
+      break
+    fi
+    now="${EPOCHREALTIME//[!0-9]/}"
+    [[ -n "$now" ]] || now=$(( SECONDS * 1000000 ))
+    if (( status == 2 )); then
+      if (( MENU_RESIZED )); then
+        MENU_RESIZED=0
+        ui_term_size
+        menu_prepare
+        printf '\033[H\033[2J'
+      fi
+      # Forget half-typed digits after a pause.
+      if [[ -n "$digits" ]] && (( now - last_digit > 1500000 )); then
+        digits=""
+      fi
+      continue
+    fi
+    case "$UI_KEY" in
+      up|k) menu_move -1 ;;
+      down|j|$'\t') menu_move 1 ;;
+      home) MENU_SEL=0; menu_move 1 ;;
+      end) MENU_SEL=$(( ${#MENU_ROWS[@]} - 1 )) ;;
+      pgup) for _ in 1 2 3 4 5; do menu_move -1; done ;;
+      pgdn) for _ in 1 2 3 4 5; do menu_move 1; done ;;
+      [0-9])
+        # "1" then "3" within a moment reaches item 13, as typing "13" did before.
+        if [[ -n "$digits" ]] && (( now - last_digit < 1500000 )) && menu_jump "${digits}${UI_KEY}"; then
+          digits+="$UI_KEY"
+        else
+          digits="$UI_KEY"
+          menu_jump "$digits" || digits=""
+        fi
+        last_digit=$now
+        # Nothing longer can follow (e.g. "5" or "13"): drop the buffer.
+        if [[ -n "$digits" ]] && ! menu_has_longer "$digits"; then
+          digits=""
+        fi
+        ;;
+
+      backspace) digits="" ;;
+      enter|' ')
+        IFS='|' read -r MENU_CHOICE _ <<< "${MENU_ROWS[MENU_SEL]}"
+        break
+        ;;
+      q|Q|esc)
+        MENU_CHOICE="exit"
+        break
+        ;;
+    esac
+  done
+  printf '\033[?7h\033[?25h'
+  stty echo 2>/dev/null || true
+}
+
+# Numbered menu for input that is not a terminal (piped or redirected).
+menu_select_plain() {
+  local row id num label answer
+  printf '%s\n' "$MENU_STATUS"
+  for row in "${MENU_ROWS[@]}"; do
+    if [[ "$row" == \#* ]]; then
+      printf '\n  %s\n' "${row#\#}"
+    elif [[ -n "$row" ]]; then
+      IFS='|' read -r id num label _ <<< "$row"
+      printf '  [%2s] %s\n' "$num" "$label"
+    fi
+  done
+  if ! read -r -p "  Select an option [0-17]: " answer; then
+    MENU_CHOICE="exit"
+    return
+  fi
+  MENU_CHOICE=""
+  if menu_jump "$answer"; then
+    IFS='|' read -r MENU_CHOICE _ <<< "${MENU_ROWS[MENU_SEL]}"
+  fi
+}
+
+menu_goodbye() {
+  ui_restore_terminal
+  if [[ -t 1 ]]; then printf '\033[H\033[2J'; fi
+  printf '\n%b  SuTun closed. Run %bsutun%b%b to open the menu again.%b\n\n' "$CYAN" "$BOLD" "$RESET" "$CYAN" "$RESET"
+  exit 0
+}
+
+# After an update, reopen the menu from the new script instead of running old code.
+menu_reload_if_updated() {
+  [[ -f "${INSTALL_DIR}/sutun.sh" ]] || return 0
+  installed_script_is_newer || return 0
+  ui_restore_terminal
+  info "Reopening the menu with SuTun $(installed_version)..."
+  sleep 1
+  exec bash "${INSTALL_DIR}/sutun.sh" menu
+}
+
+menu() {
+  require_root
+  require_linux
+  set +e
+  set +u
+  set +o pipefail
+  trap - ERR
+
+  # If Web UI is not installed / configured, start Web-First setup immediately
+  if [[ ! -f "$WEB_CONFIG_FILE" || ! -f "$WEB_SERVICE_FILE" ]]; then
+    if ! bootstrap_web_first; then
+      return 0
+    fi
+  fi
+
+  if [[ -d "$WEB_DIR" || -f "$WEB_SERVICE_FILE" ]]; then
+    [[ -t 1 ]] && printf '\n  %b› Checking the installed files...%b\n' "$BLUE" "$RESET"
+    update_web_assets >/dev/null 2>&1 || true
+  fi
+
+  MENU_PID=$BASHPID
+  MENU_IDLE=1
+  MENU_SEL=1
+  trap 'MENU_RESIZED=1' WINCH
+  trap 'ui_restore_terminal' EXIT
+  while true; do
+    [[ -t 1 ]] && printf '\033[H\033[2J\n  %b› Loading...%b' "$BLUE" "$RESET"
+    [[ -n "$MENU_PUBLIC_IP" ]] || MENU_PUBLIC_IP="$(get_server_ip 2>/dev/null || echo "127.0.0.1")"
+    MENU_STATUS="$(menu_status_lines)"
+
+    menu_select
+    case "$MENU_CHOICE" in
+      login) run_screen generate_web_token ;;
+      password) run_screen set_web_password ;;
+      port) run_screen configure_web_port ;;
+      ssl) run_screen configure_web_ssl ;;
+      nossl) run_screen remove_web_ssl ;;
+      join) run_screen join_mesh_invite ;;
+      setup) run_screen setup_node ;;
+      invite) run_screen show_mesh_invite ;;
+      live) run_screen live_status ;;
+      diag) run_screen diagnostics ;;
+      restart|start|stop) run_screen services_screen "$MENU_CHOICE" ;;
+      logs) run_screen logs_screen ;;
+      tunnels) run_screen tunnels_screen ;;
+      tunoff) run_screen stop_tunnels_screen ;;
+      doctor) run_screen self_test ;;
+      update)
+        run_screen update_core
+        menu_reload_if_updated
+        ;;
+      uninstall)
+        run_screen uninstall_app
+        [[ ! -d "$INSTALL_DIR" && ! -f "$SERVICE_FILE" ]] && exit 0
+        ;;
+      exit) menu_goodbye ;;
+      *) [[ -t 0 ]] || { warn "Invalid option"; sleep 1; } ;;
+    esac
+  done
+}
+
+main() {
+  set +e
+  set +u
+  set +o pipefail
+  trap - ERR
+
+  if (( EUID == 0 )); then
+    ensure_sutun_cli >/dev/null 2>&1 || true
+  fi
+
+  case "${1:-menu}" in
+  menu) menu ;;
+  install|setup)
+    require_linux
+    if bootstrap_web_first; then
+      menu
+    fi
+    ;;
+  setup-node) require_linux; setup_node ;;
+  join|join-mesh) shift; require_root; require_linux; join_mesh_invite "$@" ;;
+  invite|invite-code) shift; require_root; require_linux; show_mesh_invite "$@" ;;
+  status)
+    MENU_PUBLIC_IP="$(get_server_ip 2>/dev/null || echo "127.0.0.1")"
+    ui_term_size
+    section "SUTUN STATUS"
+    menu_status_lines
+    printf '\n'
+    ;;
+  peers) "${BIN_DIR}/easytier-cli" peer ;;
+  routes) "${BIN_DIR}/easytier-cli" route ;;
+  logs) journalctl -u sutun.service -u sutun-web.service -f -n 50 ;;
+  update) require_linux; update_core ;;
+  uninstall) require_root; require_linux; uninstall_app ;;
+  delete|delete-node|node-delete)
+    require_root; require_linux
+    if [[ "$1" == "delete" && -t 0 ]]; then
+      delete_mesh
+    else
+      delete_mesh_noninteractive
+    fi
+    ;;
+  realm-create) shift; require_linux; create_realm_tunnel_noninteractive "$@" ;;
+  realm-edit) shift; require_linux; edit_realm_tunnel_noninteractive "$@" ;;
+  realm-delete) shift; require_linux; delete_realm_tunnel_noninteractive "$@" ;;
+  realm-start) require_root; require_linux; systemctl start sutun-realm.service ;;
+  realm-stop) require_root; require_linux; systemctl stop sutun-realm.service ;;
+  realm-restart) require_root; require_linux; systemctl restart sutun-realm.service ;;
+  haproxy-create) shift; require_linux; create_haproxy_tunnel_noninteractive "$@" ;;
+  haproxy-edit) shift; require_linux; edit_haproxy_tunnel_noninteractive "$@" ;;
+  haproxy-delete) shift; require_linux; delete_haproxy_tunnel_noninteractive "$@" ;;
+  iptables-create) shift; require_linux; create_iptables_tunnel_noninteractive "$@" ;;
+  iptables-edit) shift; require_linux; edit_iptables_tunnel_noninteractive "$@" ;;
+  iptables-delete) shift; require_linux; delete_iptables_tunnel_noninteractive "$@" ;;
+  gost-create) shift; require_linux; create_gost_tunnel_noninteractive "$@" ;;
+  gost-edit) shift; require_linux; edit_gost_tunnel_noninteractive "$@" ;;
+  gost-delete) shift; require_linux; delete_gost_tunnel_noninteractive "$@" ;;
+  gost-start) require_root; require_linux; systemctl start sutun-gost.service ;;
+  gost-stop) require_root; require_linux; systemctl stop sutun-gost.service ;;
+  gost-restart) require_root; require_linux; systemctl restart sutun-gost.service ;;
+  # link-* take the carrier (xdi or pck); the icmp-* names are kept for the ICMP-only panel calls.
+  icmp-invite) require_root; require_linux; ensure_icmp_listen_link xdi ;;
+  link-invite) shift; require_root; require_linux; ensure_icmp_listen_link "${1:-xdi}" ;;
+  icmp-join|link-join) shift; require_root; require_linux; create_icmp_dial_link "$@" ;;
+  icmp-list|icmp-links|link-list|links) require_linux; list_icmp_links ;;
+  tunnels|tunnel-list) require_linux; tunnels_overview ;;
+  tunnels-stop) require_root; require_linux; stop_all_tunnels ;;
+  tunnels-apply) require_root; require_linux; reapply_tunnels ;;
+  icmp-delete|link-delete) shift; require_root; require_linux; delete_icmp_link "$@" ;;
+  icmp-prune|link-prune) require_root; require_linux; prune_icmp_links ;;
+  icmp-apply|link-apply) require_root; require_linux; apply_icmp_links ;;
+  web|link|token|login-link) require_root; require_linux; generate_web_token ;;
+  password|reset-password) require_root; require_linux; set_web_password ;;
+  port|change-port) require_root; require_linux; configure_web_port ;;
+  web-start) require_root; require_linux; systemctl start sutun-web.service ;;
+  web-stop)
+    require_root; require_linux
+    if systemctl status sutun-web.service 2>/dev/null | grep -q "deactivating"; then
+      systemctl kill -s SIGKILL sutun-web.service 2>/dev/null || true
+    fi
+    systemctl disable --now sutun-web.service 2>/dev/null || systemctl stop sutun-web.service 2>/dev/null || true
+    ;;
+  web-restart)
+    require_root; require_linux
+    if systemctl status sutun-web.service 2>/dev/null | grep -q "deactivating"; then
+      systemctl kill -s SIGKILL sutun-web.service 2>/dev/null || true
+    fi
+    systemctl restart sutun-web.service 2>/dev/null || (systemctl kill -s SIGKILL sutun-web.service 2>/dev/null && systemctl start sutun-web.service 2>/dev/null) || true
+    ;;
+  iperf-start) require_root; require_linux; write_iperf_service; systemctl enable --now sutun-iperf.service ;;
+  iperf-stop) require_root; require_linux; systemctl disable --now sutun-iperf.service 2>/dev/null || systemctl stop sutun-iperf.service 2>/dev/null || true ;;
+  iperf-restart) require_root; require_linux; write_iperf_service; systemctl restart sutun-iperf.service ;;
+  write-runner) require_root; require_linux; write_runner; write_iperf_service; systemctl daemon-reload ;;
+  node-restart|node-apply) require_root; require_linux; apply_node_config ;;
+  web-update|update-all-assets|node-update) require_root; require_linux; update_node_full ;;
+  ssl|web-ssl) require_root; require_linux; configure_web_ssl ;;
+  remove-ssl|web-ssl-remove) require_root; require_linux; remove_web_ssl ;;
+  self-test|doctor) require_linux; self_test ;;
+  start|restart)
+    require_root; require_linux
+    trap '' INT
+    if start_all_services restart; then
+      ok "All services started."
+    else
+      warn "Some services did not start; run 'sutun self-test' for details."
+    fi
+    ;;
+  stop)
+    require_root; require_linux
+    stop_all_services
+    warn "All services stopped."
+    ;;
+
+  version|-v|--version) echo "${APP} ${VERSION} (${DEFAULT_BRANCH}) - © ${OWNER}" ;;
+  help|-h|--help)
+    printf '\n'
+    say "  ${APP} v${VERSION} — CLI Commands Reference" "$BOLD$CYAN"
+    printf '  %-20s %s\n' "sutun" "Open the interactive terminal manager"
+    printf '  %-20s %s\n' "sutun token" "Generate a 1-hour one-click Web UI login URL"
+    printf '  %-20s %s\n' "sutun password" "Configure or change Web Admin password"
+    printf '  %-20s %s\n' "sutun port" "Change the Web Dashboard HTTP/HTTPS port"
+    printf '  %-20s %s\n' "sutun ssl" "Configure free automated SSL/TLS (HTTPS) domain certificate"
+    printf '  %-20s %s\n' "sutun remove-ssl" "Revert Web Dashboard back to HTTP"
+    printf '  %-20s %s\n' "sutun join" "Join an existing mesh network using invite code (xrmesh://)"
+    printf '  %-20s %s\n' "sutun invite" "Show invite code to connect other servers to this mesh"
+    printf '  %-20s %s\n' "sutun status" "Show node, mesh, and Web UI status summary"
+    printf '  %-20s %s\n' "sutun peers" "Show connected peers and live latency"
+    printf '  %-20s %s\n' "sutun routes" "Show mesh routing table"
+    printf '  %-20s %s\n' "sutun link-list" "Show ICMP/PCK links (BackPack) and their packet counters"
+    printf '  %-20s %s\n' "sutun link-delete" "Delete one ICMP/PCK link by name (e.g. out-1234)"
+    printf '  %-20s %s\n' "sutun tunnels" "Show saved tunnels, their ports and service state"
+    printf '  %-20s %s\n' "sutun tunnels-stop" "Stop all tunnels and keep them off after a reboot"
+    printf '  %-20s %s\n' "sutun tunnels-apply" "Start the saved tunnels again"
+    printf '  %-20s %s\n' "sutun logs" "Stream live systemd service logs"
+    printf '  %-20s %s\n' "sutun self-test" "Run installation and service health self-tests"
+    printf '  %-20s %s\n' "sutun start" "Start or apply node and start all services"
+    printf '  %-20s %s\n' "sutun restart" "Restart all SuTun services"
+    printf '  %-20s %s\n' "sutun stop" "Stop all SuTun services"
+    printf '  %-20s %s\n' "sutun update" "Update core CLI, Web UI assets, and EasyTier binaries"
+    printf '  %-20s %s\n' "sutun delete" "Delete node configuration while keeping binaries"
+    printf '  %-20s %s\n' "sutun uninstall" "Completely remove SuTun, services, and binaries"
+    printf '  %-20s %s\n' "sutun version" "Print version information"
+    printf '\n'
+    ;;
+  *)
+    echo "Usage: $0 [menu|join|invite|token|password|port|ssl|remove-ssl|status|peers|routes|tunnels|tunnels-stop|tunnels-apply|logs|self-test|start|restart|stop|update|delete|uninstall|version|help]"
+    exit 2
+    ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

@@ -1,0 +1,19 @@
+[Unit]
+Description=SuTun Web UI & API Daemon
+Documentation=https://github.com/mdjes/SuTun
+Wants=network-online.target sutun.service
+After=network-online.target sutun.service
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/sutun/web.env
+ExecStart=/usr/bin/python3 /opt/sutun/web/server.py
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+ProtectHome=read-only
+SyslogIdentifier=sutun-web
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+{
+  "version": "3.1.0",
+  "branch": "main",
+  "release_name": "SuTun v3.1.0 (Tunnels between servers fixed)",
+  "release_date": "2026-09-28",
+  "changelog": "Creating, editing or deleting a tunnel on another server works again: no more \"NetworkError\" or JSON errors, remote changes wait long enough for the engine to install, and failures say exactly what went wrong.",
+  "update_command": "bash <(curl -fsSL https://raw.githubusercontent.com/mdjes/SuTun/main/sutun.sh) update"
+}

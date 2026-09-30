@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+*.log
+node_modules/
+
+# Agent / Skills Workspace Artifacts
+.agents/
+skills-lock.json

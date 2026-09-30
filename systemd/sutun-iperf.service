@@ -1,0 +1,18 @@
+[Unit]
+Description=SuTun iperf3 In-Mesh Speedtest Daemon
+Documentation=https://github.com/mdjes/SuTun
+PartOf=sutun.service
+After=network-online.target sutun.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/sutun/sutun-iperf-runner
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+KillMode=mixed
+SyslogIdentifier=sutun-iperf
+
+[Install]
+WantedBy=multi-user.target

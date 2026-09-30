@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+
+import base64
+import importlib.util
+import io
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+SERVER_PATH = ROOT_DIR / "web" / "server.py"
+SPEC = importlib.util.spec_from_file_location("sutun_web_server_join", SERVER_PATH)
+server = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(server)
+
+
+def make_invite(**overrides):
+    payload = {
+        "v": 1,
+        "net": "alpha-mesh",
+        "secret": "4f1c9e02b7d35a68",
+        "endpoint": "185.100.200.30:11010",
+        "proto": "udp",
+    }
+    payload.update(overrides)
+    return "xrmesh://" + base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+def call_handler(method, path, body=None):
+    """Run one request through SuTunHandler and return the raw bytes written to the socket."""
+    raw = json.dumps(body or {}).encode("utf-8")
+    handler = server.SuTunHandler.__new__(server.SuTunHandler)
+    handler.rfile = io.BytesIO(raw)
+    handler.wfile = io.BytesIO()
+    handler.headers = {"Content-Length": str(len(raw)), "Content-Type": "application/json"}
+    handler.path = path
+    handler.command = method
+    handler.request_version = "HTTP/1.0"
+    handler.requestline = f"{method} {path} HTTP/1.0"
+    handler.client_address = ("127.0.0.1", 50000)
+    getattr(handler, f"do_{method}")()
+    return handler.wfile.getvalue()
+
+
+def parse_single_response(testcase, raw):
+    """Fail unless exactly one HTTP response with a JSON body was written."""
+    testcase.assertEqual(raw.count(b"HTTP/1.0 "), 1, f"expected one HTTP response, got: {raw!r}")
+    head, body = raw.split(b"\r\n\r\n", 1)
+    status = int(head.split(b" ", 2)[1])
+    return status, json.loads(body.decode("utf-8"))
+
+
+class InviteDecodingTests(unittest.TestCase):
+    def test_decodes_codes_mangled_by_copy_paste(self):
+        token = make_invite()[len("xrmesh://"):]
+        variants = {
+            "plain": f"xrmesh://{token}",
+            "uppercase prefix and whitespace": f"  XRMESH://{token}  \n",
+            "wrapped lines": "xrmesh://" + "\n".join(token[i:i + 40] for i in range(0, len(token), 40)),
+            "bidi marks": f"\u200fxrmesh://{token}\u200e",
+            "cli box output": f"  │  xrmesh://{token}\n  ├── Mesh Parameters ──",
+            "missing padding": f"xrmesh://{token.rstrip('=')}",
+            "url-safe alphabet": f"xrmesh://{token.replace('+', '-').replace('/', '_')}",
+            "quoted": f'"xrmesh://{token}"',
+            "trailing words": f"xrmesh://{token} Network Name : alpha-mesh",
+        }
+        for name, raw in variants.items():
+            with self.subTest(name):
+                invite = server.decode_invite_token(raw)
+                self.assertEqual(invite["net"], "alpha-mesh")
+                self.assertEqual(invite["secret"], "4f1c9e02b7d35a68")
+                self.assertEqual(invite["proto"], "udp")
+
+    def test_rejects_unusable_codes(self):
+        incomplete = "xrmesh://" + base64.b64encode(b'{"net": "alpha-mesh"}').decode("ascii")
+        cases = {
+            "": "invalid_invite",
+            "hello there": "invalid_invite",
+            "xrmesh://": "invalid_invite",
+            "xrmesh://" + base64.b64encode(b"[1, 2]").decode("ascii"): "invalid_invite",
+            incomplete: "invite_incomplete",
+        }
+        for raw, code in cases.items():
+            with self.subTest(raw=raw):
+                with self.assertRaises(server.InviteTokenError) as ctx:
+                    server.decode_invite_token(raw)
+                self.assertEqual(ctx.exception.code, code)
+
+    def test_icmp_invite_requires_valid_link_details(self):
+        link = {"t": "a" * 48, "p": 20042, "i": 42}
+        invite = server.decode_invite_token(make_invite(proto="icmp", icmp=link))
+        self.assertEqual((invite["proto"], invite["icmp"]), ("icmp", link))
+
+        bad_links = {
+            "missing": None,
+            "short token": {**link, "t": "abc"},
+            "token with quotes": {**link, "t": 'a"b' * 8},
+            "port out of range": {**link, "p": 70000},
+            "index out of range": {**link, "i": 16384},
+            "boolean index": {**link, "i": True},
+        }
+        for name, bad in bad_links.items():
+            with self.subTest(name):
+                overrides = {"proto": "icmp"}
+                if bad is not None:
+                    overrides["icmp"] = bad
+                with self.assertRaises(server.InviteTokenError) as ctx:
+                    server.decode_invite_token(make_invite(**overrides))
+                self.assertEqual(ctx.exception.code, "invite_icmp_missing")
+
+        with self.assertRaises(server.InviteTokenError):
+            server.decode_invite_token(make_invite(proto="icmp", icmp=link, endpoint="evil;host:11010"))
+
+    def test_pck_invite_reads_its_link(self):
+        link = {"t": "a" * 48, "p": 24567, "i": 42}
+        invite = server.decode_invite_token(make_invite(proto="pck", link=link))
+        self.assertEqual((invite["proto"], invite["icmp"]), ("pck", link))
+        with self.assertRaises(server.InviteTokenError) as ctx:
+            server.decode_invite_token(make_invite(proto="pck"))
+        self.assertEqual(ctx.exception.code, "invite_icmp_missing")
+        self.assertIn("PCK", str(ctx.exception))
+
+    def test_unknown_protocol_falls_back_to_dual_and_keeps_transport_settings(self):
+        invite = server.decode_invite_token(make_invite(proto="carrier-pigeon", enc=False, kcp=True, mtu=1300, ipv6=True))
+        self.assertEqual(invite["proto"], "dual")
+        self.assertEqual((invite["enc"], invite["kcp"], invite["mtu"], invite["ipv6"]), (False, True, 1300, True))
+
+
+class NodeJoinEndpointTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        config_file = os.path.join(self.tmp.name, "config.env")
+        for name, value in {
+            "CONFIG_FILE": config_file,
+            "CONFIG_BACKUP_FILE": config_file + ".bak",
+            "CONFIG_STAGED_FILE": config_file + ".staged",
+        }.items():
+            patcher = mock.patch.object(server, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        auth = mock.patch.object(server, "is_authenticated", return_value=(True, "session"))
+        auth.start()
+        self.addCleanup(auth.stop)
+        server.LAST_ROLLBACK["occurred"] = False
+
+    def write_existing_config(self):
+        server.save_node_config_env({
+            "NETWORK_NAME": "old-mesh",
+            "NETWORK_SECRET": "old-secret",
+            "HOSTNAME": "tehran-edge",
+            "IPV4": "10.144.144.1",
+            "PROTOCOL": "tcp",
+            "PORT": "12000",
+            "PEERS": "91.107.130.4:12000,ws://relay.example.net:12000/",
+            "ENCRYPTION": "yes",
+            "IPV6": "no",
+            "MTU": "1380",
+            "ENABLE_KCP": "yes",
+        })
+        with open(server.CONFIG_FILE, "rb") as f:
+            return f.read()
+
+    def test_join_sends_one_response_and_replaces_config(self):
+        self.write_existing_config()
+        for stale in (server.CONFIG_BACKUP_FILE, server.CONFIG_STAGED_FILE):
+            Path(stale).write_text("NETWORK_SECRET='old-secret'\n", encoding="utf-8")
+        server.LAST_ROLLBACK["occurred"] = True
+
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "online")) as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(),
+                "hostname": "tehran-edge",
+                "ipv4": "10.144.144.23",
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["data"]["network_name"], "alpha-mesh")
+        run_cmd.assert_called_once_with(["node-restart"])
+
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        self.assertEqual(cfg["NETWORK_NAME"], "alpha-mesh")
+        self.assertEqual(cfg["NETWORK_SECRET"], "4f1c9e02b7d35a68")
+        self.assertEqual(cfg["PROTOCOL"], "udp")
+        self.assertEqual(cfg["IPV4"], "10.144.144.23")
+        # Old-mesh peers are gone; the name carries over and the mesh port comes from the invite.
+        self.assertEqual(cfg["PEERS"], "185.100.200.30:11010")
+        self.assertEqual(cfg["HOSTNAME"], "tehran-edge")
+        self.assertEqual(cfg["PORT"], "11010")
+        self.assertEqual(cfg["ENABLE_KCP"], "no")
+        self.assertEqual(cfg["ENCRYPTION"], "yes")
+        self.assertFalse(os.path.exists(server.CONFIG_BACKUP_FILE))
+        self.assertFalse(os.path.exists(server.CONFIG_STAGED_FILE))
+        self.assertFalse(server.LAST_ROLLBACK["occurred"])
+
+    def test_join_applies_transport_settings_from_invite(self):
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "")):
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(enc=False, kcp=True, mtu=1300, ipv6=True),
+                "hostname": "frankfurt-2",
+                "ipv4": "10.144.144.40",
+                "port": 11010,
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"]), (200, True))
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        self.assertEqual((cfg["ENCRYPTION"], cfg["ENABLE_KCP"], cfg["MTU"], cfg["IPV6"]), ("no", "yes", "1300", "yes"))
+
+    def test_failed_start_restores_previous_config(self):
+        original = self.write_existing_config()
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=[(False, "easytier exited"), (True, "")]) as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {"invite": make_invite(), "hostname": "tehran-edge"})
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 500)
+        self.assertEqual((payload["ok"], payload["code"], payload["restored"]), (False, "start_failed", True))
+        self.assertIn("easytier exited", payload["error"])
+        with open(server.CONFIG_FILE, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(run_cmd.call_args_list[-1], mock.call(["node-restart"]))
+
+    def test_failed_start_without_previous_config_cleans_up(self):
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=[(False, "easytier exited"), (True, "")]) as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {"invite": make_invite(), "hostname": "frankfurt-2"})
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["code"]), (500, "start_failed"))
+        self.assertEqual(run_cmd.call_args_list[-1], mock.call(["delete-node"]))
+
+    def test_rejects_bad_input_without_touching_config(self):
+        original = self.write_existing_config()
+        cases = [
+            ({"invite": "not an invite"}, "invalid_invite"),
+            ({"invite": make_invite(), "hostname": "-bad name"}, "invalid_hostname"),
+            ({"invite": make_invite(), "ipv4": "10.144.144.300"}, "invalid_ipv4"),
+            ({"invite": make_invite(), "port": 70000}, "invalid_port"),
+        ]
+        for body, code in cases:
+            with self.subTest(code=code):
+                with mock.patch.object(server, "run_sutun_cmd") as run_cmd:
+                    raw = call_handler("POST", "/api/node/join", body)
+                status, payload = parse_single_response(self, raw)
+                self.assertEqual((status, payload["code"]), (400, code))
+                run_cmd.assert_not_called()
+                with open(server.CONFIG_FILE, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_join_keeps_this_servers_multi_thread_choice(self):
+        # A fresh server starts multi-threaded; an existing one keeps what it had.
+        for existing, expected in ((None, "yes"), ("", "no"), ("yes", "yes"), ("no", "no")):
+            with self.subTest(existing=existing):
+                if os.path.exists(server.CONFIG_FILE):
+                    os.remove(server.CONFIG_FILE)
+                if existing is not None:
+                    self.write_existing_config()
+                    cfg = server.load_env_file(server.CONFIG_FILE)
+                    cfg["MULTI_THREAD"] = existing
+                    server.save_node_config_env(cfg)
+                with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "")):
+                    raw = call_handler("POST", "/api/node/join", {"invite": make_invite(), "hostname": "frankfurt-2"})
+                status, _ = parse_single_response(self, raw)
+                self.assertEqual(status, 200)
+                self.assertEqual(server.load_env_file(server.CONFIG_FILE)["MULTI_THREAD"], expected)
+
+    def test_invite_round_trips_transport_settings(self):
+        self.write_existing_config()
+        with mock.patch.object(server, "get_server_public_ip", return_value="185.100.200.30"):
+            raw = call_handler("GET", "/api/node/invite")
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 200)
+        invite = server.decode_invite_token(payload["data"]["invite"])
+        self.assertEqual(invite["endpoint"], "185.100.200.30:12000")
+        self.assertEqual((invite["proto"], invite["enc"], invite["kcp"], invite["mtu"]), ("tcp", True, True, 1380))
+
+    def test_icmp_invite_embeds_a_link(self):
+        self.write_existing_config()
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        cfg["PROTOCOL"] = "icmp"
+        server.save_node_config_env(cfg)
+        link_out = '  > Downloading BackPack...\n  [OK] verified\n{"t":"' + "b" * 48 + '","p":20042,"i":42}'
+        with mock.patch.object(server, "get_server_public_ip", return_value="185.100.200.30"), \
+                mock.patch.object(server, "run_sutun_cmd", return_value=(True, link_out)) as run_cmd:
+            raw = call_handler("GET", "/api/node/invite")
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 200)
+        run_cmd.assert_called_once_with(["icmp-invite"], timeout=120)
+        invite = server.decode_invite_token(payload["data"]["invite"])
+        self.assertEqual(invite["icmp"], {"t": "b" * 48, "p": 20042, "i": 42})
+        self.assertEqual(invite["mtu"], server.ICMP_MESH_MTU)
+
+    def test_icmp_join_peers_across_the_link(self):
+        self.write_existing_config()
+        link = {"t": "c" * 48, "p": 20042, "i": 42}
+        calls = []
+
+        def fake_run(args, timeout=45):
+            calls.append(args)
+            if args[0] == "icmp-join":
+                return True, '{"name":"out-42","peer_ip":"10.214.0.170"}'
+            return True, "online"
+
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=fake_run):
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(proto="icmp", icmp=link, mtu=1380),
+                "hostname": "tehran-edge",
+                "ipv4": "10.144.144.23",
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"]), (200, True))
+        self.assertEqual(calls[0], ["icmp-join", "185.100.200.30", "20042", "c" * 48, "42"])
+        self.assertEqual(calls[1], ["node-restart"])
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        # EasyTier dials the other server's tunnel address on its mesh port, not its public IP.
+        self.assertEqual(cfg["PEERS"], "udp://10.214.0.170:11010")
+        self.assertEqual((cfg["PROTOCOL"], cfg["MTU"]), ("icmp", str(server.ICMP_MESH_MTU)))
+
+    def test_icmp_join_failure_leaves_config_untouched(self):
+        original = self.write_existing_config()
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(False, "BackPack download failed")) as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(proto="icmp", icmp={"t": "d" * 48, "p": 20001, "i": 1}),
+                "hostname": "tehran-edge",
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["code"]), (500, "icmp_link_failed"))
+        self.assertIn("BackPack download failed", payload["error"])
+        run_cmd.assert_called_once()
+        with open(server.CONFIG_FILE, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_icmp_start_failure_removes_new_link_and_restores(self):
+        original = self.write_existing_config()
+        responses = [
+            (True, '{"name":"out-1","peer_ip":"10.214.0.6"}'),
+            (False, "easytier exited"),
+            (True, ""),
+            (True, ""),
+        ]
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=responses) as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(proto="icmp", icmp={"t": "e" * 48, "p": 20001, "i": 1}),
+                "hostname": "tehran-edge",
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["code"]), (500, "start_failed"))
+        self.assertIn(mock.call(["icmp-delete", "out-1"]), run_cmd.call_args_list)
+        with open(server.CONFIG_FILE, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+
+    def test_pck_invite_embeds_a_link(self):
+        self.write_existing_config()
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        cfg["PROTOCOL"] = "pck"
+        server.save_node_config_env(cfg)
+        link_out = '  [OK] verified\n{"t":"' + "b" * 48 + '","p":24567,"i":42}'
+        with mock.patch.object(server, "get_server_public_ip", return_value="185.100.200.30"), \
+                mock.patch.object(server, "run_sutun_cmd", return_value=(True, link_out)) as run_cmd:
+            raw = call_handler("GET", "/api/node/invite")
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 200)
+        run_cmd.assert_called_once_with(["link-invite", "pck"], timeout=120)
+        details = payload["data"]["details"]
+        # PCK links travel as "link"; "icmp" stays reserved for ICMP codes older joiners understand.
+        self.assertEqual(details["link"], {"t": "b" * 48, "p": 24567, "i": 42})
+        self.assertNotIn("icmp", details)
+        invite = server.decode_invite_token(payload["data"]["invite"])
+        self.assertEqual((invite["proto"], invite["mtu"]), ("pck", server.ICMP_MESH_MTU))
+
+    def test_pck_join_peers_across_the_link(self):
+        self.write_existing_config()
+        link = {"t": "c" * 48, "p": 24567, "i": 42}
+        calls = []
+
+        def fake_run(args, timeout=45):
+            calls.append(args)
+            if args[0] == "link-join":
+                return True, '{"name":"out-42","peer_ip":"10.214.0.170"}'
+            return True, "online"
+
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=fake_run):
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(proto="pck", link=link, mtu=1380, enc=False),
+                "hostname": "tehran-edge",
+                "ipv4": "10.144.144.23",
+            })
+
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"]), (200, True))
+        self.assertEqual(calls[0], ["link-join", "185.100.200.30", "24567", "c" * 48, "42", "pck"])
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        self.assertEqual(cfg["PEERS"], "udp://10.214.0.170:11010")
+        self.assertEqual((cfg["PROTOCOL"], cfg["MTU"], cfg["ENCRYPTION"]), ("pck", str(server.ICMP_MESH_MTU), "no"))
+
+    def test_joined_server_points_to_the_main_server_until_asked_for_a_code(self):
+        link_dir = os.path.join(self.tmp.name, "icmp-links")
+        os.makedirs(link_dir)
+        with open(os.path.join(link_dir, "out-42.env"), "w") as f:
+            f.write("LINK_NAME=out-42\nROLE=dial\nPEER_HOST=185.100.200.30\nCARRIER=pck\nPEER_IP=10.214.0.170\n")
+        self.write_existing_config()
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        cfg.update({"PROTOCOL": "pck", "PEERS": "udp://10.214.0.170:11010"})
+        server.save_node_config_env(cfg)
+        link_out = '{"t":"' + "b" * 48 + '","p":24567,"i":7}'
+
+        with mock.patch.object(server, "ICMP_LINK_DIR", link_dir), \
+                mock.patch.object(server, "get_server_public_ip", return_value="5.160.10.20"), \
+                mock.patch.object(server, "run_sutun_cmd", return_value=(True, link_out)) as run_cmd:
+            status, payload = parse_single_response(self, call_handler("GET", "/api/node/invite"))
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["data"], {"joined_via": "185.100.200.30", "proto": "pck"})
+            run_cmd.assert_not_called()
+
+            status, payload = parse_single_response(self, call_handler("GET", "/api/node/invite?here=1"))
+            self.assertEqual(status, 200)
+            run_cmd.assert_called_once_with(["link-invite", "pck"], timeout=120)
+            self.assertEqual(payload["data"]["details"]["link"]["i"], 7)
+
+
+class BackpackPeerTransportTests(unittest.TestCase):
+    def test_reads_tunnel_remote_hosts_from_the_verbose_peer_listing(self):
+        listing = [{
+            "route": {"peer_id": 111, "hostname": "abroad"},
+            "peer": {"peer_id": 111, "conns": [{"tunnel": {"tunnel_type": "udp", "remote_addr": {"url": "udp://10.214.0.170:11010"}}}]},
+        }, {
+            "route": {"peer_id": 222, "hostname": "shiraz"},
+            "peer": {"peer_id": 222, "conns": [{"tunnel": {"tunnel_type": "udp", "remote_addr": "udp://5.160.10.21:11010"}}]},
+        }, {
+            "route": {"peer_id": 333, "hostname": "relayed"},
+            "peer": None,
+        }]
+        done = mock.Mock(returncode=0, stdout=json.dumps(listing))
+        with mock.patch.object(server.subprocess, "run", return_value=done):
+            hosts = server.get_easytier_peer_remote_hosts()
+        self.assertEqual(hosts, {"111": {"10.214.0.170"}, "222": {"5.160.10.21"}})
+
+    def test_joined_via_needs_a_dial_link_the_config_peers_through(self):
+        links = [
+            {"role": "listen", "transport": "pck", "peer_ip": "10.214.0.169", "peer_host": ""},
+            {"role": "dial", "transport": "pck", "peer_ip": "10.214.0.170", "peer_host": "185.100.200.30"},
+        ]
+        self.assertEqual(server.joined_via_link(links, "udp://10.214.0.170:11010"), "185.100.200.30")
+        self.assertEqual(server.joined_via_link(links, "udp://10.214.0.1:11010"), "")
+        self.assertEqual(server.joined_via_link(links[:1], "udp://10.214.0.169:11010"), "")
+
+
+class NodeConfigEndpointTests(unittest.TestCase):
+    """Saving node settings from the panel (POST /api/node/config)."""
+
+    setUp = NodeJoinEndpointTests.setUp
+    write_existing_config = NodeJoinEndpointTests.write_existing_config
+
+    def valid_body(self, **overrides):
+        body = {
+            "network_name": "alpha-mesh",
+            "network_secret": "4f1c9e02b7d35a68",
+            "hostname": "frankfurt-2",
+            "ipv4": "10.144.144.40",
+            "port": 11010,
+            "protocol": "quic",
+            "peers": ["185.100.200.30", "wg://203.0.113.9:11011"],
+            "encryption": True,
+            "ipv6": False,
+            "mtu": 1360,
+            "enable_kcp": True,
+            "multi_thread": True,
+        }
+        body.update(overrides)
+        return body
+
+    def test_saves_every_setting(self):
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "")) as run_cmd:
+            raw = call_handler("POST", "/api/node/config", self.valid_body())
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"]), (200, True))
+        run_cmd.assert_called_once_with(["node-restart"])
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        self.assertEqual(cfg["PROTOCOL"], "quic")
+        self.assertEqual(cfg["PEERS"], "185.100.200.30:11010,wg://203.0.113.9:11011")
+        self.assertEqual((cfg["MTU"], cfg["ENABLE_KCP"], cfg["MULTI_THREAD"], cfg["IPV6"]), ("1360", "yes", "yes", "no"))
+
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "")):
+            call_handler("POST", "/api/node/config", self.valid_body(multi_thread=False))
+        self.assertEqual(server.load_env_file(server.CONFIG_FILE)["MULTI_THREAD"], "no")
+
+    def test_rejects_bad_input_without_touching_config(self):
+        original = self.write_existing_config()
+        cases = {
+            "unknown protocol": {"protocol": "carrier-pigeon"},
+            "bad ipv4": {"ipv4": "10.144.144.300"},
+            "ipv4 with prefix": {"ipv4": "10.144.144.4/24"},
+            "bad hostname": {"hostname": "-bad name"},
+            "port not a number": {"port": "abc"},
+            "port out of range": {"port": 70000},
+            "mtu not a number": {"mtu": "big"},
+            "mtu too small": {"mtu": 100},
+            "line break in name": {"network_name": "mesh\nPEERS=evil"},
+            "missing secret": {"network_secret": ""},
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name):
+                with mock.patch.object(server, "run_sutun_cmd") as run_cmd:
+                    raw = call_handler("POST", "/api/node/config", self.valid_body(**overrides))
+                status, payload = parse_single_response(self, raw)
+                self.assertEqual((status, payload["ok"]), (400, False))
+                run_cmd.assert_not_called()
+                with open(server.CONFIG_FILE, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
+    def test_failed_start_restores_previous_config(self):
+        original = self.write_existing_config()
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=[(False, "easytier exited"), (True, "")]) as run_cmd:
+            raw = call_handler("POST", "/api/node/config", self.valid_body())
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"], payload["restored"]), (500, False, True))
+        self.assertIn("easytier exited", payload["error"])
+        with open(server.CONFIG_FILE, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(run_cmd.call_args_list, [mock.call(["node-restart"]), mock.call(["node-restart"])])
+
+    def test_failed_first_start_cleans_up(self):
+        with mock.patch.object(server, "run_sutun_cmd", side_effect=[(False, "easytier exited"), (True, "")]) as run_cmd:
+            raw = call_handler("POST", "/api/node/config", self.valid_body())
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["restored"]), (500, False))
+        self.assertEqual(run_cmd.call_args_list[-1], mock.call(["delete-node"]))
+
+
+class InviteCompletenessTests(unittest.TestCase):
+    """Invite codes carry every setting a joining server needs, including the mesh port and address family."""
+
+    setUp = NodeJoinEndpointTests.setUp
+    write_existing_config = NodeJoinEndpointTests.write_existing_config
+
+    def get_invite(self, ipv6_addr="", **cfg_overrides):
+        self.write_existing_config()
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        cfg.update(cfg_overrides)
+        server.save_node_config_env(cfg)
+        with mock.patch.object(server, "get_server_public_ip", return_value="185.100.200.30"), \
+                mock.patch.object(server, "get_server_public_ipv6", return_value=ipv6_addr), \
+                mock.patch.object(server, "run_sutun_cmd", return_value=(True, '{"t":"' + "a" * 48 + '","p":20001,"i":1}')):
+            raw = call_handler("GET", "/api/node/invite")
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 200)
+        return payload["data"]
+
+    def test_invite_carries_port_and_all_transport_settings(self):
+        data = self.get_invite()
+        details = data["details"]
+        self.assertEqual((details["v"], details["port"], details["mtu"]), (2, 12000, 1380))
+        self.assertEqual((details["kcp"], details["enc"], details["ipv6"]), (True, True, False))
+        self.assertEqual(data["ipv6_unavailable"], "disabled")
+        self.assertEqual(server.decode_invite_token(data["invite"])["port"], 12000)
+
+    def test_ipv6_endpoint_offered_when_enabled_and_detected(self):
+        data = self.get_invite(ipv6_addr="2a01:4f8::10", IPV6="yes", PROTOCOL="udp")
+        self.assertEqual(data["endpoint_ipv6"], "[2a01:4f8::10]:12000")
+        self.assertEqual(data["ipv6_unavailable"], "")
+
+    def test_ipv6_reasons(self):
+        cases = {
+            "icmp": {"PROTOCOL": "icmp"},
+            "pck": {"PROTOCOL": "pck"},
+            "faketcp": {"PROTOCOL": "faketcp"},
+            "not_detected": {"PROTOCOL": "udp"},
+        }
+        for reason, overrides in cases.items():
+            with self.subTest(reason):
+                data = self.get_invite(ipv6_addr="2a01:4f8::10" if reason != "not_detected" else "", IPV6="yes", **overrides)
+                self.assertEqual((data["ipv6_unavailable"], data["endpoint_ipv6"]), (reason, ""))
+
+    def test_old_codes_take_the_port_from_the_endpoint(self):
+        invite = server.decode_invite_token(make_invite(endpoint="185.100.200.30:12500"))
+        self.assertEqual(invite["port"], 12500)
+
+    def test_join_uses_invite_port_and_enables_ipv6_for_ipv6_endpoints(self):
+        with mock.patch.object(server, "run_sutun_cmd", return_value=(True, "")):
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(endpoint="[2a01:4f8::10]:12500", port=12500, ipv6=False),
+                "hostname": "tehran-edge",
+            })
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["ok"]), (200, True))
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        self.assertEqual((cfg["PORT"], cfg["IPV6"]), ("12500", "yes"))
+        self.assertEqual(cfg["PEERS"], "[2a01:4f8::10]:12500")
+
+    def test_public_ipv6_filter(self):
+        self.assertTrue(server.is_public_ipv6("2a01:4f8::10"))
+        for bad in ("fd00::1", "fe80::1", "::1", "2001:db8::1", "not-an-ip", ""):
+            self.assertFalse(server.is_public_ipv6(bad), bad)
+
+
+class IcmpCliMismatchTests(unittest.TestCase):
+    """A panel newer than the CLI script must say so instead of relaying the script's usage text."""
+
+    setUp = NodeJoinEndpointTests.setUp
+    write_existing_config = NodeJoinEndpointTests.write_existing_config
+
+    def old_script(self):
+        path = os.path.join(self.tmp.name, "sutun.sh")
+        Path(path).write_text('#!/usr/bin/env bash\nreadonly VERSION="3.0.0-beta.5"\n', encoding="utf-8")
+        return mock.patch.object(server, "get_sutun_script", return_value=path)
+
+    def test_join_reports_outdated_cli(self):
+        original = self.write_existing_config()
+        with self.old_script(), mock.patch.object(server, "run_sutun_cmd") as run_cmd:
+            raw = call_handler("POST", "/api/node/join", {
+                "invite": make_invite(proto="icmp", icmp={"t": "f" * 48, "p": 20001, "i": 1}),
+                "hostname": "tehran-edge",
+            })
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual((status, payload["code"]), (500, "icmp_link_failed"))
+        self.assertIn("sutun node-update", payload["error"])
+        self.assertIn("3.0.0-beta.5", payload["error"])
+        run_cmd.assert_not_called()
+        with open(server.CONFIG_FILE, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+    def test_invite_reports_outdated_cli(self):
+        self.write_existing_config()
+        cfg = server.load_env_file(server.CONFIG_FILE)
+        cfg["PROTOCOL"] = "icmp"
+        server.save_node_config_env(cfg)
+        with self.old_script(), mock.patch.object(server, "get_server_public_ip", return_value="185.100.200.30"), \
+                mock.patch.object(server, "run_sutun_cmd") as run_cmd:
+            raw = call_handler("GET", "/api/node/invite")
+        status, payload = parse_single_response(self, raw)
+        self.assertEqual(status, 500)
+        self.assertIn("sutun node-update", payload["error"])
+        run_cmd.assert_not_called()
+
+
+class IcmpSafeSyncTests(unittest.TestCase):
+    def test_switching_onto_or_off_icmp_is_refused(self):
+        self.assertTrue(server.icmp_protocol_switch("dual", "icmp"))
+        self.assertTrue(server.icmp_protocol_switch("icmp", "udp"))
+        self.assertFalse(server.icmp_protocol_switch("icmp", "icmp"))
+        self.assertFalse(server.icmp_protocol_switch("icmp", ""))
+        self.assertFalse(server.icmp_protocol_switch("tcp", "udp"))
+
+    def test_switching_onto_off_or_between_pck_is_refused(self):
+        self.assertTrue(server.icmp_protocol_switch("dual", "pck"))
+        self.assertTrue(server.icmp_protocol_switch("pck", "udp"))
+        self.assertTrue(server.icmp_protocol_switch("icmp", "pck"))
+        self.assertFalse(server.icmp_protocol_switch("pck", "pck"))
+
+
+if __name__ == "__main__":
+    unittest.main()

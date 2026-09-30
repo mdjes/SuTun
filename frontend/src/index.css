@@ -1,0 +1,941 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Firouzeh Console design tokens.
+ * Mode (data-theme) sets neutrals and status tones; palette (data-palette) sets the accent.
+ * index.html applies both attributes before first paint, so there is no theme flash.
+ */
+
+/*
+ * Vazirmatn (OFL, github.com/rastikerdar/vazirmatn): one variable file for every weight.
+ * The regular build, not the FD one: Latin digits stay Latin. Limited to Arabic script, which
+ * includes the Persian digits ۰–۹ and ٫ ٪, so Latin text (IPs, versions, hostnames) falls
+ * through to Inter.
+ */
+@font-face {
+  font-family: "Vazirmatn";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("./assets/fonts/Vazirmatn-wght.woff2") format("woff2");
+  unicode-range: U+0600-06FF, U+0750-077F, U+0870-088E, U+0890-0891, U+0898-08E1, U+08E3-08FF, U+200C-200E, U+2010-2011, U+204F, U+2E41, U+FB50-FDFF, U+FE70-FE74, U+FE76-FEFC;
+}
+
+@layer base {
+  :root {
+    --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-fa: "Vazirmatn", "Inter", ui-sans-serif, system-ui, Tahoma, sans-serif;
+    --font-mono: "JetBrains Mono", "Vazirmatn", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    --fs-2xs: 0.6875rem;
+    --lh-2xs: 1rem;
+    --fs-xs: 0.75rem;
+    --lh-xs: 1.125rem;
+    --fs-sm: 0.875rem;
+    --lh-sm: 1.375rem;
+    --fs-base: 1rem;
+    --lh-base: 1.5rem;
+    --lh-lg: 1.75rem;
+    --lh-xl: 1.75rem;
+    --lh-2xl: 2rem;
+    --leading-tight: 1.25;
+    --leading-snug: 1.375;
+    --leading-body: 1.5;
+
+    /* Dark neutrals (default) */
+    color-scheme: dark;
+    --bg-base: #0b0e13;
+    --bg-subtle: #10141a;
+    --bg-card: #141920;
+    --bg-elevated: #1a2029;
+    --bg-hover: rgb(255 255 255 / 0.05);
+    --bg-active: rgb(255 255 255 / 0.09);
+    --input-bg: #0f1318;
+    --border-subtle: #242b35;
+    --border-strong: #37414f;
+    --text-primary: #edf1f6;
+    --text-secondary: #c3cad4;
+    --text-muted: #9aa3b2;
+    --text-subtle: #7d8696;
+    --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.03), 0 1px 2px rgb(0 0 0 / 0.35);
+    --shadow-pop: 0 18px 48px -12px rgb(0 0 0 / 0.65), 0 0 0 1px var(--border-subtle);
+    --overlay: rgb(4 6 9 / 0.72);
+    --glow-strength: 0.1;
+
+    --success-rgb: 52 211 153;
+    --warning-rgb: 251 191 36;
+    --danger-rgb: 251 113 133;
+    --info-rgb: 96 165 250;
+    --on-danger: #2b0710;
+    --on-warning: #2a1a02;
+
+    /* Firouzeh accent (default palette) */
+    --primary-rgb: 45 212 191;
+    --primary-hover: #5eead4;
+    --on-primary: #042f2a;
+  }
+
+  [data-theme="light"] {
+    color-scheme: light;
+    --bg-base: #f3f5f8;
+    --bg-subtle: #edf0f4;
+    --bg-card: #ffffff;
+    --bg-elevated: #ffffff;
+    --bg-hover: rgb(15 23 42 / 0.045);
+    --bg-active: rgb(15 23 42 / 0.085);
+    --input-bg: #ffffff;
+    --border-subtle: #e0e5ec;
+    --border-strong: #c5cdd9;
+    --text-primary: #0e1520;
+    --text-secondary: #334155;
+    --text-muted: #556274;
+    --text-subtle: #647083;
+    --shadow-card: 0 1px 2px rgb(15 23 42 / 0.05), 0 1px 3px rgb(15 23 42 / 0.04);
+    --shadow-pop: 0 18px 40px -12px rgb(15 23 42 / 0.2), 0 0 0 1px var(--border-subtle);
+    --overlay: rgb(15 23 42 / 0.42);
+    --glow-strength: 0.07;
+
+    --success-rgb: 4 120 87;
+    --warning-rgb: 180 83 9;
+    --danger-rgb: 190 18 60;
+    --info-rgb: 29 78 216;
+    --on-danger: #ffffff;
+    --on-warning: #ffffff;
+
+    --primary-rgb: 15 118 110;
+    --primary-hover: #115e59;
+    --on-primary: #ffffff;
+  }
+
+  /* Palettes: accent per mode. Firouzeh is the :root default above. */
+  [data-palette="ocean"] {
+    --primary-rgb: 56 189 248;
+    --primary-hover: #7dd3fc;
+    --on-primary: #03161f;
+  }
+  [data-palette="ocean"][data-theme="light"] {
+    --primary-rgb: 3 105 161;
+    --primary-hover: #075985;
+    --on-primary: #ffffff;
+  }
+  [data-palette="iris"] {
+    --primary-rgb: 165 180 252;
+    --primary-hover: #c7d2fe;
+    --on-primary: #16134a;
+  }
+  [data-palette="iris"][data-theme="light"] {
+    --primary-rgb: 79 70 229;
+    --primary-hover: #4338ca;
+    --on-primary: #ffffff;
+  }
+  [data-palette="saffron"] {
+    --primary-rgb: 251 191 36;
+    --primary-hover: #fcd34d;
+    --on-primary: #2a1a02;
+  }
+  [data-palette="saffron"][data-theme="light"] {
+    --primary-rgb: 180 83 9;
+    --primary-hover: #92400e;
+    --on-primary: #ffffff;
+  }
+  [data-palette="graphite"] {
+    --primary-rgb: 226 232 240;
+    --primary-hover: #ffffff;
+    --on-primary: #0b0e13;
+  }
+  [data-palette="graphite"][data-theme="light"] {
+    --primary-rgb: 30 41 59;
+    --primary-hover: #0f172a;
+    --on-primary: #ffffff;
+  }
+  /* Midnight: true-black surfaces for OLED screens, ocean accent. */
+  [data-palette="midnight"] {
+    --primary-rgb: 56 189 248;
+    --primary-hover: #7dd3fc;
+    --on-primary: #03161f;
+  }
+  [data-palette="midnight"][data-theme="dark"] {
+    --bg-base: #000000;
+    --bg-subtle: #07080a;
+    --bg-card: #0b0c0f;
+    --bg-elevated: #121419;
+    --input-bg: #060709;
+    --border-subtle: #1c1f26;
+    --border-strong: #2c313a;
+    --glow-strength: 0.06;
+  }
+  [data-palette="midnight"][data-theme="light"] {
+    --primary-rgb: 3 105 161;
+    --primary-hover: #075985;
+    --on-primary: #ffffff;
+  }
+
+  /*
+   * Persian: larger small sizes and taller lines keep the script legible. Persian letters reach
+   * far above and below the baseline (گ، ک، ی، ج), so body text needs about 1.8x its size and
+   * headings about 1.6x, where Latin is fine with 1.5x and 1.3x.
+   */
+  [dir="rtl"] {
+    --fs-2xs: 0.75rem;
+    --lh-2xs: 1.25rem;
+    --fs-xs: 0.8125rem;
+    --lh-xs: 1.4375rem;
+    --fs-sm: 0.90625rem;
+    --lh-sm: 1.625rem;
+    --lh-base: 1.875rem;
+    --lh-lg: 2rem;
+    --lh-xl: 2.125rem;
+    --lh-2xl: 2.5rem;
+    --leading-tight: 1.5;
+    --leading-snug: 1.6;
+    --leading-body: 1.8;
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+    /* No double-tap zoom on controls; pinch zoom still works. */
+    touch-action: manipulation;
+  }
+
+  /*
+   * iOS Safari zooms the page into any focused field under 16px and never zooms back out.
+   * Touch-only, so desktop keeps the compact type scale.
+   */
+  @media (pointer: coarse) {
+    input,
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
+  }
+
+  body {
+    min-height: 100dvh;
+    overflow-x: hidden;
+    background-color: var(--bg-base);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    line-height: var(--leading-body);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  [lang="fa"] body,
+  [lang="fa"] button,
+  [lang="fa"] input,
+  [lang="fa"] select,
+  [lang="fa"] textarea {
+    font-family: var(--font-fa);
+    font-feature-settings: normal;
+  }
+
+  /* Letter-spacing breaks cursive Persian joins. */
+  [dir="rtl"] * {
+    letter-spacing: normal !important;
+  }
+
+  code,
+  kbd,
+  pre,
+  samp {
+    font-family: var(--font-mono);
+  }
+
+  ::selection {
+    background: rgb(var(--primary-rgb) / 0.3);
+  }
+
+  :where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+    outline: 2px solid rgb(var(--primary-rgb));
+    outline-offset: 2px;
+  }
+
+  button,
+  a,
+  summary,
+  [role="button"] {
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--text-subtle);
+    opacity: 1;
+  }
+
+  /* Hide the native search clear button; the fields draw their own. */
+  input[type="search"]::-webkit-search-cancel-button {
+    -webkit-appearance: none;
+  }
+
+  summary {
+    list-style: none;
+  }
+  summary::-webkit-details-marker {
+    display: none;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border-strong);
+    border-radius: 8px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+}
+
+@layer components {
+  /* Native select with a chevron that sits at the inline end in both directions. */
+  .select-field {
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='none' stroke='%238a93a3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' viewBox='0 0 24 24'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.75rem center;
+    background-size: 1rem;
+    padding-inline-end: 2.25rem;
+  }
+  [dir="rtl"] .select-field:not([dir="ltr"]),
+  [dir="ltr"] .select-field[dir="rtl"] {
+    background-position: left 0.75rem center;
+  }
+  .select-field option {
+    background-color: var(--bg-elevated);
+    color: var(--text-primary);
+  }
+
+  /* Side sheet entering from the inline end (right in LTR, left in RTL). */
+  .sheet-from-end {
+    animation: sheetFromRight 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+  [dir="rtl"] .sheet-from-end {
+    animation-name: sheetFromLeft;
+  }
+
+  /* Translucent bars (app header, bottom nav) over scrolling content. */
+  .glass-bar {
+    background-color: color-mix(in srgb, var(--bg-base) 80%, transparent);
+    -webkit-backdrop-filter: blur(16px) saturate(1.4);
+    backdrop-filter: blur(16px) saturate(1.4);
+  }
+  @supports not (background-color: color-mix(in srgb, red 50%, transparent)) {
+    .glass-bar {
+      background-color: var(--bg-base);
+    }
+  }
+
+  .skeleton {
+    background: linear-gradient(90deg, var(--bg-subtle) 0%, var(--bg-hover) 50%, var(--bg-subtle) 100%);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  .pb-safe {
+    padding-bottom: max(0.5rem, env(safe-area-inset-bottom));
+  }
+
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .login-shake {
+    animation: loginShake 360ms cubic-bezier(0.36, 0.07, 0.19, 0.97) both;
+  }
+}
+
+/* ─── Ambient backdrop ───────────────────────────────────────────────── */
+
+/* Soft accent light drifting behind the page. Gradients, not blur filters, so it stays cheap to animate. */
+.bd-aurora {
+  position: absolute;
+  border-radius: 9999px;
+  background: radial-gradient(closest-side, rgb(var(--primary-rgb) / calc(var(--glow-strength) * var(--bd-boost, 1))), transparent);
+  will-change: transform;
+}
+.bd-aurora--a {
+  width: 70vmax;
+  height: 46vmax;
+  top: -24vmax;
+  left: calc(50% - 35vmax);
+  animation: auroraA 26s ease-in-out infinite alternate;
+}
+.bd-aurora--b {
+  width: 52vmax;
+  height: 52vmax;
+  bottom: -30vmax;
+  left: -18vmax;
+  --bd-boost: 0.7;
+  animation: auroraB 34s ease-in-out infinite alternate;
+}
+.bd-aurora--c {
+  width: 46vmax;
+  height: 46vmax;
+  top: 18vh;
+  right: -22vmax;
+  --bd-boost: 0.55;
+  animation: auroraC 30s ease-in-out infinite alternate;
+}
+
+/* Dot lattice that fades out toward the edges. */
+.bd-dots {
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(var(--border-strong) 1px, transparent 1.2px);
+  background-size: 26px 26px;
+  opacity: 0.5;
+  mask-image: radial-gradient(ellipse 75% 60% at 50% 0%, #000 10%, transparent 75%);
+  -webkit-mask-image: radial-gradient(ellipse 75% 60% at 50% 0%, #000 10%, transparent 75%);
+}
+.bd-hero .bd-dots {
+  mask-image: radial-gradient(ellipse 60% 55% at 50% 40%, #000 15%, transparent 80%);
+  -webkit-mask-image: radial-gradient(ellipse 60% 55% at 50% 40%, #000 15%, transparent 80%);
+}
+
+/* Faint mesh of peers with packets travelling between them. */
+.bd-mesh {
+  position: absolute;
+  top: 0;
+  width: 50%;
+  height: 100%;
+  color: rgb(var(--primary-rgb));
+  opacity: 0.55;
+}
+[data-theme="light"] .bd-mesh {
+  opacity: 0.4;
+}
+.bd-link {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+  fill: none;
+}
+.bd-packet {
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  fill: none;
+  stroke-dasharray: 5 105;
+  stroke-dashoffset: 6;
+  animation: bdPacket var(--dur, 6s) linear infinite;
+  animation-delay: var(--delay, 0s);
+}
+.bd-node {
+  fill: var(--bg-elevated);
+  stroke: var(--border-strong);
+  stroke-width: 1.25;
+}
+.bd-node--live {
+  fill: currentColor;
+  stroke: none;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: bdTwinkle var(--dur, 5s) ease-in-out infinite;
+  animation-delay: var(--delay, 0s);
+}
+
+/* "Static background" preference: keep the scene, drop the motion. */
+[data-backdrop="static"] .bd-aurora,
+[data-backdrop="static"] .bd-node--live {
+  animation: none;
+}
+[data-backdrop="static"] .bd-packet {
+  display: none;
+}
+
+@keyframes auroraA {
+  from {
+    transform: translate3d(-6vmax, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(6vmax, 3vmax, 0) scale(1.12);
+  }
+}
+@keyframes auroraB {
+  from {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  to {
+    transform: translate3d(10vmax, -8vmax, 0) scale(1.15);
+  }
+}
+@keyframes auroraC {
+  from {
+    transform: translate3d(0, 0, 0) scale(1.05);
+  }
+  to {
+    transform: translate3d(-8vmax, 10vmax, 0) scale(0.92);
+  }
+}
+@keyframes bdPacket {
+  0% {
+    stroke-dashoffset: 6;
+  }
+  45%,
+  100% {
+    stroke-dashoffset: -101;
+  }
+}
+@keyframes bdTwinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.15);
+  }
+}
+
+/* ─── Mesh loader ────────────────────────────────────────────────────── */
+
+/* Four peers fire packets into the hub in turn; the hub answers with a ripple while the orbit keeps turning. */
+.ml-svg {
+  overflow: visible;
+  color: rgb(var(--primary-rgb));
+}
+.ml-orbit-track {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.14;
+  stroke-width: 1.5;
+}
+.ml-orbit {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  stroke-dasharray: 22 78;
+  transform-origin: 40px 40px;
+  animation: mlSpin 1.6s linear infinite;
+}
+.ml-orbit--slow {
+  stroke-width: 1.5;
+  stroke-opacity: 0.45;
+  stroke-dasharray: 8 92;
+  animation-duration: 3.2s;
+  animation-direction: reverse;
+}
+.ml-track {
+  fill: none;
+  stroke: currentColor;
+  stroke-opacity: 0.2;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+}
+.ml-packet {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  stroke-dasharray: 26 130;
+  stroke-dashoffset: 27;
+  filter: drop-shadow(0 0 3px rgb(var(--primary-rgb) / 0.8));
+  animation: mlPacket 2.4s cubic-bezier(0.55, 0, 0.35, 1) infinite;
+}
+.ml-peer {
+  fill: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mlPeer 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+.ml-hub {
+  fill: var(--bg-elevated);
+  stroke: currentColor;
+  stroke-width: 3;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mlHub 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+.ml-hub-core {
+  fill: currentColor;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mlHubCore 2.4s ease-in-out infinite;
+}
+.ml-ripple {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: mlRipple 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+.ml-glow {
+  background: radial-gradient(closest-side, rgb(var(--primary-rgb) / 0.28), transparent);
+  animation: mlGlow 2.4s ease-in-out infinite;
+}
+
+@keyframes mlSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes mlPacket {
+  0% {
+    stroke-dashoffset: 27;
+  }
+  38%,
+  100% {
+    stroke-dashoffset: -101;
+  }
+}
+@keyframes mlPeer {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.7;
+  }
+  8% {
+    transform: scale(1.35);
+    opacity: 1;
+  }
+  30% {
+    transform: scale(1);
+    opacity: 0.85;
+  }
+}
+@keyframes mlHub {
+  0%,
+  30%,
+  100% {
+    transform: scale(1);
+  }
+  40%,
+  52%,
+  64%,
+  76% {
+    transform: scale(1.12);
+  }
+  46%,
+  58%,
+  70% {
+    transform: scale(1.02);
+  }
+  88% {
+    transform: scale(1);
+  }
+}
+@keyframes mlHubCore {
+  0%,
+  30% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+  78% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.3);
+  }
+}
+@keyframes mlRipple {
+  0%,
+  76% {
+    opacity: 0;
+    transform: scale(1);
+  }
+  80% {
+    opacity: 0.7;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(3.2);
+  }
+}
+@keyframes mlGlow {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.9);
+  }
+  78% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* ─── Entrances & micro-interactions ─────────────────────────────────── */
+
+/* Children rise in one after another. `.stagger-nested` reaches one level deeper (a tab's sections). */
+.stagger > *,
+.stagger-nested > * > * {
+  animation: rise 460ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.stagger > :nth-child(2),
+.stagger-nested > * > :nth-child(2) {
+  animation-delay: 50ms;
+}
+.stagger > :nth-child(3),
+.stagger-nested > * > :nth-child(3) {
+  animation-delay: 100ms;
+}
+.stagger > :nth-child(4),
+.stagger-nested > * > :nth-child(4) {
+  animation-delay: 150ms;
+}
+.stagger > :nth-child(5),
+.stagger-nested > * > :nth-child(5) {
+  animation-delay: 200ms;
+}
+.stagger > :nth-child(6),
+.stagger-nested > * > :nth-child(6) {
+  animation-delay: 250ms;
+}
+.stagger > :nth-child(7),
+.stagger-nested > * > :nth-child(7) {
+  animation-delay: 300ms;
+}
+.stagger > :nth-child(n + 8),
+.stagger-nested > * > :nth-child(n + 8) {
+  animation-delay: 340ms;
+}
+
+/* Toast countdown: a hairline that drains toward the inline start. */
+.toast-timer {
+  transform-origin: left;
+  animation: toastTimer var(--toast-life, 4s) linear both;
+}
+[dir="rtl"] .toast-timer {
+  transform-origin: right;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes toastTimer {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* ─── Live speed test & ping ─────────────────────────────────────────── */
+
+/* Particles streaming along a route track; --flow-duration follows throughput. */
+.flow-dot {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 6px;
+  height: 6px;
+  margin-top: -3px;
+  border-radius: 9999px;
+  background: rgb(var(--primary-rgb));
+  box-shadow: 0 0 8px rgb(var(--primary-rgb) / 0.8);
+  animation: flowAcross var(--flow-duration, 1.6s) linear infinite;
+}
+
+/* One echo request: out to the destination and back. */
+.ping-packet {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 10px;
+  height: 10px;
+  margin-top: -5px;
+  margin-left: -5px;
+  border-radius: 9999px;
+  animation: pingEcho 900ms cubic-bezier(0.45, 0, 0.55, 1) both;
+}
+.ping-packet--lost {
+  animation: pingLost 900ms cubic-bezier(0.33, 1, 0.68, 1) both;
+}
+
+/* Ring spreading from a node when a reply lands or a probe is sent. */
+.ping-ripple {
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  border: 2px solid currentColor;
+  animation: pingRipple 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.ping-ripple--loop {
+  animation: pingRipple 1.8s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+/* A latency bar rising from the baseline when its reply lands. */
+.ping-bar {
+  transform-origin: bottom;
+  animation: barGrow 520ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* A short dash sweeping along the dial while the speed test is still connecting. */
+.gauge-scan {
+  animation: gaugeScan 1.4s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+}
+
+@keyframes gaugeScan {
+  from {
+    stroke-dashoffset: 90;
+  }
+  to {
+    stroke-dashoffset: -1000;
+  }
+}
+
+@keyframes flowAcross {
+  0% {
+    left: 0%;
+    opacity: 0;
+  }
+  12%,
+  88% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
+  }
+}
+
+@keyframes pingEcho {
+  0% {
+    left: 0%;
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  8% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    left: 100%;
+    transform: scale(1.15);
+  }
+  92% {
+    opacity: 1;
+  }
+  100% {
+    left: 0%;
+    opacity: 0;
+    transform: scale(0.8);
+  }
+}
+
+@keyframes pingLost {
+  0% {
+    left: 0%;
+    opacity: 0;
+  }
+  10% {
+    opacity: 1;
+  }
+  70% {
+    opacity: 1;
+  }
+  100% {
+    left: 62%;
+    opacity: 0;
+    transform: scale(0.4);
+  }
+}
+
+@keyframes barGrow {
+  from {
+    transform: scaleY(0);
+    opacity: 0.4;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+@keyframes pingRipple {
+  0% {
+    opacity: 0;
+    transform: scale(1);
+  }
+  10% {
+    opacity: 0.7;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.9);
+  }
+}
+
+@keyframes sheetFromRight {
+  from {
+    transform: translateX(100%);
+  }
+  to {
+    transform: none;
+  }
+}
+@keyframes sheetFromLeft {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: none;
+  }
+}
+@keyframes loginShake {
+  10%,
+  90% {
+    transform: translateX(-1px);
+  }
+  20%,
+  80% {
+    transform: translateX(2px);
+  }
+  30%,
+  50%,
+  70% {
+    transform: translateX(-4px);
+  }
+  40%,
+  60% {
+    transform: translateX(4px);
+  }
+}
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

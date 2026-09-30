@@ -1,0 +1,74 @@
+SuTun Source-Available License
+Version 1.0, July 2026
+
+Copyright (c) 2026 mdjes. All Rights Reserved.
+
+1. OWNERSHIP
+
+SuTun, including its source code, documentation, name, branding, design,
+and all modified or derivative versions, is the intellectual property of
+mdjes unless otherwise stated.
+
+2. LIMITED PERMISSION
+
+You may download and use SuTun for personal or internal purposes. You may
+modify your private local copy solely for your own personal or internal use.
+
+3. PROHIBITED ACTIONS
+
+Without prior written permission from mdjes, you may not:
+
+a. copy, publish, redistribute, sublicense, mirror, or publicly host SuTun,
+   in whole or in part;
+
+b. publish SuTun or a modified or derivative version in another GitHub,
+   GitLab, or other public or private software repository;
+
+c. remove, hide, replace, or alter the SuTun name, mdjes attribution,
+   copyright notice, license notice, or other ownership information;
+
+d. present SuTun, or any modified or derivative version of it, as your own
+   work or under another author, developer, project, or brand name;
+
+e. sell, rent, monetize, commercially exploit, or include SuTun in a paid
+   product or service;
+
+f. use any part of SuTun as the basis of another publicly distributed
+   project, installer, management script, or software package.
+
+The availability of the source code does not grant permission to redistribute
+or republish it. Public access to the official repository is provided only for
+inspection, installation, personal use, and contribution to the official
+SuTun project.
+
+4. CONTRIBUTIONS
+
+Bug reports and proposed changes should be submitted to the official SuTun
+repository. Submission of a contribution grants mdjes a perpetual,
+worldwide, irrevocable, royalty-free right to use, modify, license, and
+distribute that contribution as part of SuTun.
+
+5. THIRD-PARTY SOFTWARE
+
+This license applies only to SuTun. EasyTier and other third-party
+components remain subject to their own respective licenses. Nothing in this
+license limits rights granted directly by those third-party licenses.
+
+6. TERMINATION
+
+Any permission granted by this license terminates automatically if you violate
+its terms. Upon termination, you must stop using SuTun and remove all copies
+under your control, except where retention is required by law.
+
+7. NO WARRANTY
+
+SUTUN IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. IN NO EVENT SHALL MDJES BE
+LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR RELATED TO
+SUTUN OR ITS USE.
+
+8. PERMISSION REQUESTS
+
+Permission for redistribution, commercial use, or another use prohibited by
+this license must be obtained in writing from mdjes before that use begins.

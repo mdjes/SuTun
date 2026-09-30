@@ -1,0 +1,57 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check Bash syntax
+        run: bash -n sutun.sh
+
+      - name: Run ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck sutun.sh
+
+      - name: Verify executable bit and LF endings
+        run: |
+          test -x sutun.sh
+          ! grep -Il $'\r' sutun.sh README.md README_FA.md LICENSE
+
+      - name: Test embedded HAProxy port parser
+        run: bash tests/port_parser_test.sh
+
+      - name: Test iptables tunnel helpers
+        run: bash tests/iptables_tunnel_test.sh
+
+      - name: Test GOST tunnel helpers
+        run: bash tests/gost_tunnel_test.sh
+
+      - name: Test tunnels overview and emergency stop
+        run: bash tests/tunnels_overview_test.sh
+
+      - name: Test ICMP link helpers
+        run: bash tests/icmp_link_test.sh
+
+      - name: Test node runner arguments
+        run: bash tests/node_runner_test.sh
+
+      - name: Test Web UI helpers and backend
+        run: |
+          python3 tests/web_interfaces_test.py
+          python3 tests/live_benchmark_test.py
+          python3 tests/node_join_test.py
+          python3 tests/update_flow_test.py
+          python3 tests/tunnel_routes_test.py
+          bash tests/update_verify_test.sh
+          python3 -m py_compile web/server.py
+          bash tests/web_api_test.sh
